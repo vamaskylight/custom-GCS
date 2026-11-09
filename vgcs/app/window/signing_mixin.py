@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QPushButton,
 )
 
-from vgcs.app import secret_store
+from vgcs.app import secret_store, ui_theme
 from vgcs.app.vehicle_messages import SEVERITY_WARNING
 from vgcs.link.signing import (
     DRONE_SIGNS_NO_KEY,
@@ -266,7 +266,7 @@ class MainWindowSigningMixin:
             "The passphrase is not stored. The key is, encrypted for this Windows user."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
         grid.addWidget(hint, 2, 0, 1, 4)
         group.setLayout(grid)
         return group

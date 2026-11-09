@@ -661,7 +661,7 @@ class NativeTileMapView(QWidget):
         self._disk_warm_bridge = _TileFetchSignals()
         self._disk_warm_bridge.loaded.connect(self._on_tile_loaded)
         self._pool = QThreadPool.globalInstance()
-        self.setStyleSheet("background-color: #1a1d24;")
+        self.setStyleSheet("background-color: #222222;")  # ui_theme.WINDOW
         # >1.0 enlarges the vehicle chevron (used when the map is mirrored into the small video-swap card).
         self._vehicle_arrow_scale = 1.0
         self._sync_view_zoom()

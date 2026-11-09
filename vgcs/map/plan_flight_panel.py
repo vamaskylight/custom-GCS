@@ -30,11 +30,13 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QToolButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from vgcs.app import ui_theme as t
 from vgcs.mission import clamp_hover_seconds
 from vgcs.mission.fence import NO_KEEPIN_WORDS, NO_NOFLY_WORDS, NO_POLYGON_WORDS, NO_RETURN_POINT_WORDS
 from vgcs.mission.long_range_safety import (
@@ -45,13 +47,15 @@ from vgcs.mission.long_range_safety import (
 )
 
 
+# The tool column's names and their icons (vgcs/assets/ui_icons). Text symbols until the
+# 2026-11-09 restyle, a few pixels high and drawn differently by every font.
 _TOOLS: tuple[tuple[str, str], ...] = (
-    ("File", "\u21A9"),
-    ("Takeoff", "\u2191"),
-    ("Waypoint", "\u2295"),
-    ("ROI", "\u25C7"),
-    ("Pattern", "\u25A6"),
-    ("Center", "\u2726"),
+    ("File", "file"),
+    ("Takeoff", "takeoff"),
+    ("Waypoint", "goto"),
+    ("ROI", "fence"),
+    ("Pattern", "pattern"),
+    ("Center", "follow_map"),
 )
 _TOOL_HINTS: dict[str, str] = {
     "Takeoff": (
@@ -76,275 +80,292 @@ _TEMPLATE_LABELS: dict[str, str] = {
     "structure": "Structure Scan",
 }
 
-_PLAN_FLIGHT_QSS = """
-QWidget#planFlightLayer {
+_PLAN_FLIGHT_QSS = f"""
+QWidget#planFlightLayer {{
     background: transparent;
-}
-QWidget#planFlightTopBar {
-    background: rgba(32, 34, 40, 247);
-    border-bottom: 1px solid rgba(70, 76, 88, 217);
-}
-QLabel#planExit {
-    color: #f3f4f6;
+}}
+QWidget#planFlightTopBar {{
+    background: {t.WINDOW};
+    border-bottom: 1px solid rgba(255, 255, 255, 40);
+}}
+QLabel#planExit {{
+    color: {t.TEXT};
     font-size: 18px;
     font-weight: 600;
     padding: 0 12px;
-}
-QLabel#planExit:hover {
-    color: #facc15;
-}
-QPushButton#planBarUpload {
+}}
+QLabel#planExit:hover {{
+    color: {t.HIGHLIGHT_HOVER};
+}}
+QPushButton#planBarUpload {{
     min-height: 32px;
     padding: 0 18px;
     margin-right: 22px;
-    border-radius: 6px;
-    border: 1px solid rgba(110, 118, 135, 217);
-    background: rgba(58, 62, 74, 242);
-    color: #e8eaef;
+    border-radius: 16px;
+    border: 1px solid {t.HIGHLIGHT_HOVER};
+    background: {t.HIGHLIGHT};
+    color: {t.TEXT};
     font-size: 13px;
-    font-weight: 600;
-}
-QPushButton#planBarUpload:hover { background: rgba(72, 78, 92, 250); }
-QPushButton#planBarUpload:disabled { color: rgba(232, 234, 239, 100); }
-QLabel.pfLabel {
-    color: #9ca3b0;
+    font-weight: 700;
+}}
+QPushButton#planBarUpload:hover {{ background: {t.HIGHLIGHT_HOVER}; }}
+QPushButton#planBarUpload:disabled {{
+    color: rgba(255, 255, 255, 110);
+    background: rgba(255, 255, 255, 18);
+    border-color: rgba(255, 255, 255, 40);
+}}
+QLabel.pfLabel {{
+    color: {t.TEXT_DIM};
     font-size: 11px;
     font-weight: 600;
-}
-QLabel.pfMetric { color: #f3f4f6; font-size: 13px; }
-QLabel.pfMetricValue { color: #ffffff; font-size: 13px; font-weight: 700; }
-QWidget#planWorkspace { background: transparent; }
-QFrame#planFlightToolRail {
-    background: rgba(28, 30, 36, 245);
-    border: 1px solid rgba(65, 70, 82, 230);
-    border-radius: 8px;
-}
-QPushButton.planToolBtn {
+}}
+QLabel.pfMetric {{ color: {t.TEXT}; font-size: 13px; }}
+QLabel.pfMetricValue {{ color: {t.TEXT}; font-size: 13px; font-weight: 700; }}
+QWidget#planWorkspace {{ background: transparent; }}
+QFrame#planFlightToolRail {{
+    background: {t.OVERLAY_CARD};
+    border: 1px solid rgba(255, 255, 255, 34);
+    border-radius: 14px;
+}}
+QToolButton.planToolBtn {{
     min-height: 52px;
-    border-radius: 6px;
-    border: 1px solid rgba(70, 76, 88, 217);
-    background: rgba(40, 44, 52, 242);
-    color: #e8eaef;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: {t.TEXT};
     font-size: 11px;
     font-weight: 600;
     padding: 4px 2px;
     text-align: center;
-}
-QPushButton.planToolBtn:hover { background: rgba(55, 60, 72, 250); }
-QPushButton.planToolBtn:checked {
-    background: #facc15;
-    color: #111827;
-    border-color: #ca8a04;
-}
-QFrame#planCenterPanel {
-    background: rgba(36, 39, 48, 250);
-    border: 1px solid rgba(70, 76, 88, 230);
-    border-radius: 8px;
-}
-QLabel.planFileSectionTitle {
-    color: #f9fafb;
+}}
+QToolButton.planToolBtn:hover {{ background: rgba(255, 255, 255, 30); border-color: rgba(255, 255, 255, 60); }}
+QToolButton.planToolBtn:checked {{
+    background: {t.HIGHLIGHT};
+    color: {t.TEXT};
+    border-color: {t.HIGHLIGHT_HOVER};
+}}
+QFrame#planCenterPanel {{
+    background: {t.WINDOW};
+    border: 1px solid {t.BORDER};
+    border-radius: {t.RADIUS}px;
+}}
+QLabel.planFileSectionTitle {{
+    color: {t.TEXT};
     font-size: 13px;
     font-weight: 700;
-}
-QFrame.planTplCard {
-    border: 1px solid rgba(90, 96, 110, 217);
-    border-radius: 6px;
-    background: rgba(28, 30, 36, 250);
-}
-QFrame.planTplCard:hover {
-    border-color: rgba(250, 204, 21, 165);
-}
-QLabel.planTplLabel {
-    background: rgba(24, 26, 32, 250);
-    color: #e8eaef;
+}}
+QFrame.planTplCard {{
+    border: 1px solid {t.BORDER};
+    border-radius: 8px;
+    background: {t.WINDOW_SHADE_DARK};
+}}
+QFrame.planTplCard:hover {{
+    border-color: {t.HIGHLIGHT};
+}}
+QLabel.planTplLabel {{
+    background: {t.WINDOW_SHADE};
+    color: {t.TEXT};
     font-size: 11px;
     font-weight: 600;
     padding: 6px 4px;
-    border-top: 1px solid rgba(70, 76, 88, 217);
-}
-QLabel.planTplPreview {
-    background: rgb(45, 55, 72);
-    color: rgba(232, 234, 239, 180);
+    border-top: 1px solid {t.BORDER};
+}}
+QLabel.planTplPreview {{
+    background: {t.WINDOW_SHADE};
+    color: {t.TEXT_DIM};
     font-size: 11px;
     min-height: 82px;
-    border-top-left-radius: 5px;
-    border-top-right-radius: 5px;
-}
-QPushButton.planFileBtn {
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+}}
+QPushButton.planFileBtn {{
     min-height: 30px;
     padding: 0 12px;
-    border-radius: 5px;
-    border: 1px solid rgba(90, 96, 110, 230);
-    background: rgba(48, 52, 62, 242);
-    color: #e8eaef;
+    border-radius: 6px;
+    border: 1px solid {t.BUTTON_BORDER};
+    background: {t.BUTTON};
+    color: {t.TEXT};
     font-size: 12px;
     font-weight: 600;
-}
-QPushButton.planFileBtn:hover:!disabled { background: rgba(62, 68, 82, 250); }
-QPushButton.planFileBtn:disabled { color: rgba(232, 234, 239, 110); }
-QPushButton.planFileBtnPrimary {
-    background: rgba(88, 82, 118, 242);
-    border-color: rgba(120, 110, 160, 217);
-}
-QPushButton.planFileBtnPrimary:hover:!disabled { background: rgba(100, 94, 132, 250); }
-QFrame#planRightPanel {
-    background: rgba(36, 38, 46, 240);
-    border: 1px solid rgba(92, 96, 120, 217);
-    border-radius: 6px;
-}
-QPushButton.planTab {
+}}
+QPushButton.planFileBtn:hover:!disabled {{ background: {t.BUTTON_HOVER}; }}
+QPushButton.planFileBtn:disabled {{ color: {t.TEXT_FAINT}; background: #2c2c31; border-color: #3a3a40; }}
+QPushButton.planFileBtnPrimary {{
+    background: {t.HIGHLIGHT};
+    border-color: {t.HIGHLIGHT_HOVER};
+}}
+QPushButton.planFileBtnPrimary:hover:!disabled {{ background: {t.HIGHLIGHT_HOVER}; }}
+QFrame#planRightPanel {{
+    background: {t.WINDOW};
+    border: 1px solid {t.BORDER};
+    border-radius: {t.RADIUS}px;
+}}
+QPushButton.planTab {{
     border: none;
-    background: #3a3d4a;
-    color: #e8eaef;
+    background: {t.WINDOW_SHADE};
+    color: {t.TEXT_DIM};
     font-size: 12px;
     font-weight: 600;
     padding: 8px 4px;
     min-height: 36px;
-    border-right: 1px solid rgba(0, 0, 0, 72);
-}
-QPushButton.planTab:hover:!checked { background: #45485a; }
-QPushButton.planTab:checked {
-    background: #f5e6a0;
-    color: #111827;
+    border-right: 1px solid rgba(0, 0, 0, 90);
+}}
+QPushButton.planTab:hover:!checked {{ background: {t.BUTTON_HOVER}; color: {t.TEXT}; }}
+QPushButton.planTab:checked {{
+    background: {t.HIGHLIGHT};
+    color: {t.TEXT};
     font-weight: 700;
-}
-QLabel.planSectionHeader {
-    background: #4d5170;
-    color: #f9fafb;
+}}
+QLabel.planSectionHeader {{
+    background: {t.WINDOW_SHADE};
+    color: {t.TEXT};
     font-size: 13px;
-    font-weight: 600;
+    font-weight: 700;
     padding: 9px 12px;
-}
-QFrame.planTabBody { background: #0c0c0e; }
-QFrame.planTabBody[fenceMode="true"] { background: #14151a; }
-QLabel.planFieldLabel {
-    color: rgba(248, 250, 252, 224);
+    border-bottom: 1px solid {t.BORDER};
+}}
+QFrame.planTabBody {{ background: {t.WINDOW}; }}
+QFrame.planTabBody[fenceMode="true"] {{ background: {t.WINDOW}; }}
+QLabel.planFieldLabel {{
+    color: {t.TEXT_DIM};
     font-size: 11px;
     font-weight: 600;
-}
-QComboBox.planRailSelect, QLineEdit.planRailInput, QDoubleSpinBox.planPatternSpin {
+}}
+QComboBox.planRailSelect, QLineEdit.planRailInput, QDoubleSpinBox.planPatternSpin {{
     min-height: 32px;
     padding: 4px 10px;
-    border-radius: 5px;
-    border: 1px solid rgba(100, 106, 124, 165);
-    background: #ffffff;
-    color: #111827;
+    border-radius: 6px;
+    border: 1px solid {t.BORDER};
+    background: {t.WINDOW_SHADE_DARK};
+    color: {t.TEXT};
     font-size: 12px;
     font-weight: 500;
-}
-QDoubleSpinBox.planPatternSpin::up-button, QDoubleSpinBox.planPatternSpin::down-button {
+}}
+QComboBox.planRailSelect:focus, QLineEdit.planRailInput:focus, QDoubleSpinBox.planPatternSpin:focus {{
+    border-color: {t.HIGHLIGHT};
+}}
+QDoubleSpinBox.planPatternSpin::up-button, QDoubleSpinBox.planPatternSpin::down-button {{
     width: 18px;
-}
-QComboBox.planRailSelect::drop-down { width: 22px; }
-QLabel.planKvKey { color: rgba(210, 214, 222, 224); font-size: 12px; }
-QLabel.planKvVal { color: #ffffff; font-size: 12px; font-weight: 700; }
-QLabel.planNoteMission {
-    color: rgba(218, 220, 228, 224);
+}}
+QComboBox.planRailSelect::drop-down {{ width: 22px; }}
+QLabel.planKvKey {{ color: {t.TEXT_DIM}; font-size: 12px; }}
+QLabel.planKvVal {{ color: {t.TEXT}; font-size: 12px; font-weight: 700; }}
+QLabel.planNoteMission {{
+    color: {t.TEXT_DIM};
     font-size: 11px;
-}
-QLabel.planHelpMuted {
-    color: rgba(232, 234, 239, 184);
+}}
+QLabel.planHelpMuted {{
+    color: {t.TEXT_DIM};
     font-size: 11px;
-}
-QPushButton#planStartMissionBtn {
+}}
+QPushButton#planStartMissionBtn {{
     min-height: 36px;
-    border-radius: 6px;
-    border: 1px solid rgba(120, 90, 40, 217);
-    background: #9a6b2d;
-    color: #ffffff;
+    border-radius: 18px;
+    border: 1px solid rgba(150, 255, 190, 200);
+    background: {t.GOOD_FILL};
+    color: {t.TEXT};
     font-size: 13px;
     font-weight: 700;
-}
-QPushButton#planStartMissionBtn:hover { background: #b07a34; }
-QPushButton.planSeqRtlBtn {
+}}
+QPushButton#planStartMissionBtn:hover {{ background: rgba(0, 176, 75, 245); }}
+QPushButton#planStartMissionBtn:disabled {{
+    color: rgba(255, 255, 255, 110);
+    background: rgba(0, 150, 64, 70);
+    border-color: rgba(150, 255, 190, 70);
+}}
+QPushButton.planSeqRtlBtn {{
     min-height: 32px;
     border-radius: 6px;
-    border: 1px solid rgba(80, 86, 102, 230);
-    background: #3d414d;
-    color: #f3f4f6;
+    border: 1px solid {t.BUTTON_BORDER};
+    background: {t.BUTTON};
+    color: {t.TEXT};
     font-size: 12px;
     font-weight: 600;
-}
-QPushButton.planSeqRtlBtn:hover { background: #4a4f5e; }
-QPushButton.planGeoBtn {
+}}
+QPushButton.planSeqRtlBtn:hover {{ background: {t.BUTTON_HOVER}; }}
+QPushButton.planGeoBtn {{
     min-height: 34px;
     padding: 8px 12px;
     border-radius: 6px;
-    border: 1px solid rgba(80, 86, 102, 230);
-    background: #3d414d;
-    color: #f3f4f6;
+    border: 1px solid {t.BUTTON_BORDER};
+    background: {t.BUTTON};
+    color: {t.TEXT};
     font-size: 12px;
     font-weight: 600;
     text-align: center;
-}
-QPushButton.planGeoBtn:hover:!disabled { background: #4a4f5e; }
-QPushButton.planGeoBtn:disabled { color: rgba(243, 244, 246, 110); }
-QLabel.planGeoTitle { color: #ffffff; font-size: 12px; font-weight: 700; }
-QLabel.planGeoLead, QLabel.planGeoStatus {
-    color: rgba(232, 234, 239, 200);
+}}
+QPushButton.planGeoBtn:hover:!disabled {{ background: {t.BUTTON_HOVER}; }}
+QPushButton.planGeoBtn:disabled {{ color: {t.TEXT_FAINT}; }}
+QLabel.planGeoTitle {{ color: {t.TEXT}; font-size: 12px; font-weight: 700; }}
+QLabel.planGeoLead, QLabel.planGeoStatus {{
+    color: {t.TEXT_DIM};
     font-size: 12px;
-}
-QFrame.planRallyInfo {
-    background: #121318;
-    border: 1px solid rgba(80, 86, 102, 140);
+}}
+QFrame.planRallyInfo {{
+    background: {t.WINDOW_SHADE_DARK};
+    border: 1px solid {t.BORDER};
     border-radius: 8px;
-}
-QLabel#planSeqPatternLabel {
-    color: #facc15;
+}}
+QLabel#planSeqPatternLabel {{
+    color: {t.ORANGE};
     font-size: 12px;
     font-weight: 700;
-}
-QFrame#planSeqPatternRow {
-    background: rgba(60, 60, 70, 180);
-    border: 1px solid rgba(110, 118, 135, 180);
+}}
+QFrame#planSeqPatternRow {{
+    background: {t.WINDOW_SHADE};
+    border: 1px solid {t.BORDER};
     border-radius: 6px;
-}
-QFrame.planWpRow {
-    background: rgba(20, 22, 28, 220);
-    border: 1px solid rgba(70, 76, 88, 180);
-    border-radius: 6px;
-}
-QLineEdit.planWpField {
-    border: 1px solid rgba(100, 106, 124, 165);
-    background: #ffffff;
-    color: #111827;
+}}
+QFrame.planWpRow {{
+    background: {t.WINDOW_SHADE_DARK};
+    border: 1px solid {t.BORDER};
+    border-radius: 8px;
+}}
+QLineEdit.planWpField {{
+    border: 1px solid {t.BORDER};
+    background: {t.WINDOW};
+    color: {t.TEXT};
     border-radius: 4px;
     padding: 3px 6px;
     font-size: 12px;
-}
-QLabel.planWpLabel {
-    color: #f3f4f6;
+}}
+QLineEdit.planWpField:focus {{ border-color: {t.HIGHLIGHT}; }}
+QLabel.planWpLabel {{
+    color: {t.TEXT};
     font-size: 12px;
     font-weight: 700;
-}
-QLabel.planWpUnit { color: #d1d5db; font-size: 11px; }
-QPushButton#planSetLaunchMapCenterBtn {
+}}
+QLabel.planWpUnit {{ color: {t.TEXT_DIM}; font-size: 11px; }}
+QPushButton#planSetLaunchMapCenterBtn {{
     min-height: 32px;
     border-radius: 6px;
-    border: 1px solid rgba(80, 86, 102, 230);
-    background: #3d414d;
-    color: #f3f4f6;
+    border: 1px solid {t.BUTTON_BORDER};
+    background: {t.BUTTON};
+    color: {t.TEXT};
     font-size: 12px;
     font-weight: 600;
-}
-QPushButton#planSetLaunchMapCenterBtn:hover { background: #4a4f5e; }
-QPushButton.planDetailsToggle {
+}}
+QPushButton#planSetLaunchMapCenterBtn:hover {{ background: {t.BUTTON_HOVER}; }}
+QPushButton.planDetailsToggle {{
     text-align: left;
     background: transparent;
-    color: #f9fafb;
+    color: {t.TEXT};
     font-size: 13px;
     font-weight: 600;
     border: none;
     border-top: 1px solid rgba(255, 255, 255, 60);
     padding: 12px 0 10px;
-}
-QPushButton.planDetailsToggle:hover { color: #facc15; }
+}}
+QPushButton.planDetailsToggle:hover {{ color: {t.HIGHLIGHT_HOVER}; }}
 """
 
 
 # What a new waypoint gets until the operator says otherwise: the map's own
 # defaults (its hidden toolbar's 20 m and 5 m/s), which is what a plan flew
 # when nobody had touched this panel.
+# The map's bottom band (the camera picture is 132 px high, 10 px from the edge, and a gap).
+_BOTTOM_HUD_BAND_PX = 152
+
 DEFAULT_NEW_WP_ALT_M = 20.0
 DEFAULT_NEW_WP_SPEED_MPS = 5.0
 # Their limits, the same as the map's own boxes. (At upload the plan check
@@ -634,15 +655,19 @@ class PlanFlightPanel(QWidget):
         v = QVBoxLayout(rail)
         v.setContentsMargins(5, 5, 5, 5)
         v.setSpacing(4)
-        self._tool_buttons: list[QPushButton] = []
+        self._tool_buttons: list[QToolButton] = []
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
-        for name, glyph in _TOOLS:
-            btn = QPushButton(f"{glyph}\n{name}", rail)
+        for name, icon_name in _TOOLS:
+            btn = QToolButton(rail)
+            btn.setText(name)
+            btn.setIcon(t.icon(icon_name, 22))
+            btn.setIconSize(QSize(22, 22))
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             btn.setProperty("class", "planToolBtn")
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setMinimumHeight(52)
+            btn.setMinimumHeight(56)
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda _c=False, n=name: self._on_tool_clicked(n))
             v.addWidget(btn)
@@ -679,8 +704,21 @@ class PlanFlightPanel(QWidget):
         v.setContentsMargins(14, 12, 14, 14)
         v.setSpacing(0)
 
-        self._center_stack = QStackedWidget(panel)
-        v.addWidget(self._center_stack)
+        self._center_stack = QStackedWidget()
+        # In a scroll area that asks for the whole height of what it holds: the panel keeps its size on a
+        # tall screen and scrolls on a low one, where it leaves the bottom band to the camera picture and
+        # the numbers (see _relayout).
+        center_scroll = _TallScrollArea(panel)
+        center_scroll.setObjectName("planCenterScroll")
+        center_scroll.setWidgetResizable(True)
+        center_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        center_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        center_scroll.setStyleSheet(
+            "QScrollArea#planCenterScroll { background: transparent; border: none; }"
+            "QScrollArea#planCenterScroll > QWidget > QWidget { background: transparent; }"
+        )
+        center_scroll.setWidget(self._center_stack)
+        v.addWidget(center_scroll)
 
         self._center_stack.addWidget(self._build_file_flyout())
         self._center_stack.addWidget(self._build_other_tool_panel())
@@ -802,7 +840,7 @@ class PlanFlightPanel(QWidget):
         self._other_tool_hint = QLabel("Select a tool from the rail.")
         self._other_tool_hint.setWordWrap(True)
         self._other_tool_hint.setStyleSheet(
-            "QLabel { color: #e8eaef; font-size: 13px; line-height: 1.45; }"
+            f"QLabel {{ color: {t.TEXT}; font-size: 13px; line-height: 1.45; }}"
         )
         v.addWidget(self._other_tool_hint)
         v.addStretch(1)
@@ -851,7 +889,10 @@ class PlanFlightPanel(QWidget):
         if center_visible:
             center_w = max(540, min(620, self._center_panel.sizeHint().width()))
             center_w = min(center_w, max(280, w - center_x - 360))
-            center_h = min(avail_h, max(220, self._center_panel.sizeHint().height()))
+            # The camera picture, the number strip and the compass sit in a band along the bottom,
+            # which the panel must leave free: at 1280 by 720 it reached into it, and the picture and
+            # the numbers covered its Upload, Download and Clear (2026-11-09). It scrolls instead.
+            center_h = min(max(220, avail_h - _BOTTOM_HUD_BAND_PX), max(220, self._center_panel.sizeHint().height()))
             self._center_panel.setGeometry(center_x, workspace_top, center_w, center_h)
 
         # Right panel: anchored to the right edge but pushed past the center panel if needed.
@@ -939,10 +980,10 @@ class PlanFlightPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { background: #0c0c0e; }")
+        scroll.setStyleSheet(f"QScrollArea {{ background: {t.WINDOW}; }}")
 
         host = QWidget()
-        host.setStyleSheet("QWidget { background: #0c0c0e; color: #e8eaef; }")
+        host.setStyleSheet(f"QWidget {{ background: {t.WINDOW}; color: {t.TEXT}; }}")
         body_v = QVBoxLayout(host)
         body_v.setContentsMargins(12, 12, 12, 12)
         body_v.setSpacing(10)
@@ -950,7 +991,7 @@ class PlanFlightPanel(QWidget):
         # Takeoff card
         self._takeoff_card = QFrame()
         self._takeoff_card.setStyleSheet(
-            "QFrame { background: rgba(20, 22, 28, 220); border: 1px solid rgba(60, 66, 80, 200); "
+            f"QFrame {{ background: {t.WINDOW_SHADE_DARK}; border: 1px solid {t.BORDER}; "
             "border-radius: 6px; }"
         )
         tc = QVBoxLayout(self._takeoff_card)
@@ -966,7 +1007,7 @@ class PlanFlightPanel(QWidget):
         )
         self._takeoff_desc.setWordWrap(True)
         self._takeoff_desc.setStyleSheet(
-            "QLabel { color: rgba(232, 234, 239, 200); font-size: 12px; }"
+            f"QLabel {{ color: {t.TEXT_DIM}; font-size: 12px; }}"
         )
         tc.addWidget(self._takeoff_desc)
 
@@ -1039,8 +1080,9 @@ class PlanFlightPanel(QWidget):
         prl = QHBoxLayout(self._pattern_row)
         prl.setContentsMargins(10, 6, 10, 6)
         prl.setSpacing(8)
-        self._pattern_glyph = QLabel("\u25A6")
-        self._pattern_glyph.setStyleSheet("color: #facc15; font-size: 14px;")
+        self._pattern_glyph = QLabel()
+        self._pattern_glyph.setPixmap(t.icon_pixmap("pattern", 16, t.ORANGE))
+        self._pattern_glyph.setStyleSheet("background: transparent; border: none;")
         prl.addWidget(self._pattern_glyph)
         self._pattern_label = QLabel("Survey")
         self._pattern_label.setObjectName("planSeqPatternLabel")
@@ -1051,7 +1093,7 @@ class PlanFlightPanel(QWidget):
 
         self._pattern_geometry_frame = QFrame()
         self._pattern_geometry_frame.setStyleSheet(
-            "QFrame { background: rgba(20, 22, 28, 200); border: 1px solid rgba(60, 66, 80, 180); "
+            f"QFrame {{ background: {t.WINDOW_SHADE_DARK}; border: 1px solid {t.BORDER}; "
             "border-radius: 6px; }"
         )
         pg = QGridLayout(self._pattern_geometry_frame)
@@ -1317,18 +1359,18 @@ class PlanFlightPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { background: #14151a; }")
+        scroll.setStyleSheet(f"QScrollArea {{ background: {t.WINDOW}; }}")
 
         host = QWidget()
         # The buttons' colours are said here as well: a rule on this widget
         # wins over the panel's own, so with the background alone every button
         # was a black box, and a pressed Draw button looked like the others.
         host.setStyleSheet(
-            "QWidget { background: #14151a; color: #e8eaef; }"
-            "QPushButton.planGeoBtn { background: #3d414d; color: #f3f4f6; min-height: 22px; padding: 6px 10px; }"
-            "QPushButton.planGeoBtn:hover:!disabled { background: #4a4f5e; }"
-            "QPushButton.planGeoBtn:disabled { background: #2a2c35; color: rgba(243, 244, 246, 110); }"
-            "QPushButton.planGeoBtn:checked { background: #f5e6a0; color: #111827; }"
+            f"QWidget {{ background: {t.WINDOW}; color: {t.TEXT}; }}"
+            f"QPushButton.planGeoBtn {{ background: {t.BUTTON}; color: {t.TEXT}; min-height: 22px; padding: 6px 10px; }}"
+            f"QPushButton.planGeoBtn:hover:!disabled {{ background: {t.BUTTON_HOVER}; }}"
+            f"QPushButton.planGeoBtn:disabled {{ background: #2c2c31; color: {t.TEXT_FAINT}; }}"
+            f"QPushButton.planGeoBtn:checked {{ background: {t.HIGHLIGHT}; color: {t.TEXT}; }}"
         )
         bv = QVBoxLayout(host)
         bv.setContentsMargins(12, 10, 12, 10)
@@ -1365,14 +1407,14 @@ class PlanFlightPanel(QWidget):
         self._fence_result_label = QLabel("The drone's answer shows here.")
         self._fence_result_label.setObjectName("planFenceResult")
         self._fence_result_label.setWordWrap(True)
-        self._fence_result_label.setStyleSheet(self._fence_result_style("#e8eaef"))
+        self._fence_result_label.setStyleSheet(self._fence_result_style(t.TEXT))
         v.addWidget(self._fence_result_label)
         return body
 
     @staticmethod
     def _fence_result_style(colour: str) -> str:
-        return ("QLabel { color: %s; font-size: 12px; background: #1b1d24; "
-                "border-top: 1px solid rgba(110, 118, 135, 160); padding: 8px 12px 10px 12px; }" % colour)
+        return ("QLabel { color: %s; font-size: 12px; background: %s; "
+                "border-top: 1px solid %s; padding: 8px 12px 10px 12px; }" % (colour, t.WINDOW_SHADE_DARK, t.BORDER))
 
     def _geo_button(self, text: str, name: str, tip: str) -> QPushButton:
         b = QPushButton(text)
@@ -1857,7 +1899,7 @@ class PlanFlightPanel(QWidget):
 
     def set_fence_result(self, ok, text: str) -> None:
         """The drone's answer to a fence request. ok None: it is still on its way."""
-        colour = "#e8eaef" if ok is None else ("#b6f0c0" if ok else "#ffb0a0")
+        colour = t.TEXT if ok is None else ("#b6f0c0" if ok else "#ffb0a0")
         self._fence_result_label.setStyleSheet(self._fence_result_style(colour))
         self._fence_result_label.setText(str(text or ""))
 
@@ -1880,10 +1922,10 @@ class PlanFlightPanel(QWidget):
             "Launch (RTL). Rally editing is not implemented in M2."
         )
         info.setWordWrap(True)
-        info.setStyleSheet("QLabel { color: #e8eaef; font-size: 12px; }")
+        info.setStyleSheet(f"QLabel {{ color: {t.TEXT}; font-size: 12px; }}")
         hv.addWidget(info)
         outer_host = QWidget()
-        outer_host.setStyleSheet("QWidget { background: #14151a; }")
+        outer_host.setStyleSheet(f"QWidget {{ background: {t.WINDOW}; }}")
         oh = QVBoxLayout(outer_host)
         oh.setContentsMargins(12, 12, 12, 12)
         oh.addWidget(host)
@@ -2346,7 +2388,7 @@ class PlanFlightPanel(QWidget):
             drop_cb.toggled.connect(lambda on, ix=idx: self._on_wp_drop_toggled(ix, on))
         else:
             hint = QLabel("Takeoff / launch altitude (0 = use WP1 for takeoff).")
-            hint.setStyleSheet("QLabel { color: rgba(232, 234, 239, 170); font-size: 11px; }")
+            hint.setStyleSheet(f"QLabel {{ color: {t.TEXT_DIM}; font-size: 11px; }}")
             hint.setWordWrap(True)
             h.addWidget(hint, 1)
             self._wp_start_alt_in = alt_in

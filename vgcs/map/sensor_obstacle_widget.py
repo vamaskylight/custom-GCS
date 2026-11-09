@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vgcs.app import ui_theme
 from vgcs.map.proximity_window import ProximityWindow
 from vgcs.skydroid.protocol import format_slr_display_m
 
@@ -39,62 +40,64 @@ _CARD_WIDTH_PX = 200
 _VIEW_BUTTON_PX = 30
 _PANEL_WIDTH_PX = _CARD_WIDTH_PX
 
-_HUD_TEXT = QColor(230, 238, 252)
+_HUD_TEXT = QColor(255, 255, 255)
 
+# The app's look (vgcs/app/ui_theme.py, the 2026-11-09 restyle): a dark translucent card, white values,
+# grey labels, the same pill buttons as the camera panels.
 _VIEW_BTN_QSS = (
     "QPushButton#obstacleViewBtn {"
-    " color: #dce5f5; font-size: 12px; font-weight: 600;"
-    " background: rgba(36, 48, 68, 200);"
-    " border: 1px solid rgba(100, 180, 255, 110);"
-    " border-radius: 8px; padding: 0 6px;"
+    f" color: {ui_theme.TEXT}; font-size: {ui_theme.FONT_BODY - 1}px; font-weight: 600;"
+    f" background-color: {ui_theme.OVERLAY_BUTTON}; border: 1px solid {ui_theme.OVERLAY_BORDER};"
+    f" border-radius: {_VIEW_BUTTON_PX // 2}px; padding: 0 10px;"
+    f" min-height: {_VIEW_BUTTON_PX - 2}px; max-height: {_VIEW_BUTTON_PX - 2}px;"
     "}"
-    "QPushButton#obstacleViewBtn:hover { background: rgba(50, 66, 92, 230); }"
+    f"QPushButton#obstacleViewBtn:hover {{ background-color: {ui_theme.OVERLAY_BUTTON_HOVER};"
+    f" border-color: {ui_theme.OVERLAY_BORDER_HOVER}; }}"
 )
 
 _CARD_QSS = (
     "QFrame#obstacleHudCard {"
-    " background: rgba(26, 33, 45, 215);"
-    " border: 1px solid rgba(80, 92, 118, 107);"
-    " border-radius: 12px;"
+    f" background-color: {ui_theme.OVERLAY_CARD};"
+    " border: 1px solid rgba(255, 255, 255, 34);"
+    " border-radius: 14px;"
     "}"
 )
 
 _LABEL_QSS = (
-    "color: #8b95a8; font-size: 9px; font-weight: 600;"
+    f"color: {ui_theme.TEXT_DIM}; font-size: 10px; font-weight: 600;"
     " letter-spacing: 0.6px; background: transparent; border: none;"
 )
-_VALUE_QSS = "color: #dce5f5; font-size: 15px; font-weight: 600; background: transparent; border: none;"
-_VALUE_ALERT_QSS = "color: #f87171; font-size: 15px; font-weight: 600; background: transparent; border: none;"
-_SUB_QSS = "color: #6b7280; font-size: 10px; font-weight: 600; background: transparent; border: none;"
-_DIVIDER_QSS = "background: rgba(80, 92, 118, 80); border: none; max-height: 1px; min-height: 1px;"
+_VALUE_QSS = f"color: {ui_theme.TEXT}; font-size: 15px; font-weight: 700; background: transparent; border: none;"
+_VALUE_ALERT_QSS = f"color: {ui_theme.RED_TEXT}; font-size: 15px; font-weight: 700; background: transparent; border: none;"
+_SUB_QSS = f"color: {ui_theme.TEXT_FAINT}; font-size: 10px; font-weight: 600; background: transparent; border: none;"
+_DIVIDER_QSS = "background: rgba(255, 255, 255, 40); border: none; max-height: 1px; min-height: 1px;"
 _PILL_TRACK_QSS = (
     "QWidget#sensorPillTrack {"
-    " background: rgba(18, 22, 30, 160);"
-    " border: 1px solid rgba(80, 92, 118, 70);"
-    " border-radius: 8px;"
+    " background-color: rgba(0, 0, 0, 110);"
+    " border: 1px solid rgba(255, 255, 255, 30);"
+    " border-radius: 10px;"
     "}"
 )
 _PILL_IDLE = (
-    "color: #8b95a8; font-size: 10px; font-weight: 600;"
-    " background: transparent; border: none; border-radius: 6px; padding: 4px 0;"
+    f"color: {ui_theme.TEXT_DIM}; font-size: 10px; font-weight: 600;"
+    " background: transparent; border: none; border-radius: 7px; padding: 4px 0;"
 )
 _PILL_ON = (
-    "color: #ecfdf5; font-size: 10px; font-weight: 600;"
-    " background: rgba(52, 211, 153, 0.22);"
-    " border: 1px solid rgba(52, 211, 153, 0.35);"
-    " border-radius: 6px; padding: 3px 0;"
+    f"color: {ui_theme.TEXT}; font-size: 10px; font-weight: 700;"
+    f" background-color: {ui_theme.INFO_FILL};"
+    " border: 1px solid rgba(190, 228, 255, 200);"
+    " border-radius: 7px; padding: 3px 0;"
 )
 _LRF_BTN_QSS = (
     "QPushButton#lrfLockBtn {"
-    " color: #64b4ff; font-size: 17px; font-weight: 600;"
-    " background: rgba(36, 48, 68, 180);"
-    " border: 1px solid rgba(100, 180, 255, 120);"
-    " border-radius: 8px; padding: 0 6px; min-height: 24px; max-height: 28px;"
+    f" color: {ui_theme.TEXT}; background-color: {ui_theme.OVERLAY_BUTTON};"
+    f" border: 1px solid {ui_theme.OVERLAY_BORDER}; border-radius: 14px; padding: 0px;"
+    " min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px;"
     "}"
-    "QPushButton#lrfLockBtn:hover { background: rgba(50, 66, 92, 220); }"
+    f"QPushButton#lrfLockBtn:hover {{ background-color: {ui_theme.OVERLAY_BUTTON_HOVER};"
+    f" border-color: {ui_theme.OVERLAY_BORDER_HOVER}; }}"
     "QPushButton#lrfLockBtn:checked {"
-    " color: #34d399; border-color: rgba(52, 211, 153, 160);"
-    " background: rgba(32, 56, 48, 200);"
+    f" background-color: {ui_theme.ACTIVE}; border-color: rgba(255, 210, 140, 230);"
     "}"
 )
 
@@ -221,11 +224,18 @@ class _LrfRangeBlock(QWidget):
         self._stack = QStackedWidget()
         self._stack.setStyleSheet("background: transparent; border: none;")
 
-        self._btn = QPushButton("⌖")
+        self._btn = QPushButton()
         self._btn.setObjectName("lrfLockBtn")
         self._btn.setCheckable(True)
         self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn.setStyleSheet(_LRF_BTN_QSS)
+        # The app's laser icon, white (it was a "⌖" character, which not every font has).
+        _laser_icon = ui_theme.icon("vama_laser", 18)
+        if _laser_icon.isNull():
+            self._btn.setText("⌖")
+        else:
+            self._btn.setIcon(_laser_icon)
+            self._btn.setIconSize(QSize(18, 18))
         self._btn.setToolTip("Arm C13 LRF — click any target on video to slew and measure")
         self._btn.clicked.connect(self.lock_clicked.emit)
         btn_wrap = QWidget()
@@ -439,7 +449,7 @@ class ObstacleRadarPanel(QFrame):
         header_font.setWeight(QFont.Weight.DemiBold)
         header.setFont(header_font)
         header.setStyleSheet(
-            "color: #9fb0cc; letter-spacing: 1px; background: transparent; border: none;"
+            f"color: {ui_theme.TEXT_DIM}; letter-spacing: 1px; background: transparent; border: none;"
         )
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_lay.addWidget(header)
@@ -486,12 +496,12 @@ class ObstacleRadarPanel(QFrame):
         status_lay.setSpacing(6)
         self._status_dot = QLabel()
         self._status_dot.setFixedSize(8, 8)
-        self._status_dot.setStyleSheet("background: #6b7280; border-radius: 4px;")
+        self._status_dot.setStyleSheet(f"background: {ui_theme.TEXT_FAINT}; border-radius: 4px;")
         self._lbl_status = QLabel("Waiting for sensors")
         status_font = QFont("Segoe UI", 10)
         status_font.setWeight(QFont.Weight.DemiBold)
         self._lbl_status.setFont(status_font)
-        self._lbl_status.setStyleSheet("color: #9fb0cc; background: transparent; border: none;")
+        self._lbl_status.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; background: transparent; border: none;")
         self._lbl_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._lbl_status.setMinimumWidth(0)
         status_lay.addWidget(self._status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -561,10 +571,10 @@ class ObstacleRadarPanel(QFrame):
 
     def _set_status_mode(self, mode: str) -> None:
         colors = {
-            "idle": "#6b7280",
-            "live": "#34d399",
-            "stale": "#fbbf24",
-            "alert": "#f87171",
+            "idle": ui_theme.TEXT_FAINT,
+            "live": ui_theme.GREEN,
+            "stale": ui_theme.ORANGE,
+            "alert": ui_theme.RED,
         }
         c = colors.get(mode, colors["idle"])
         self._status_dot.setStyleSheet(

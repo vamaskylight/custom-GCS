@@ -18,24 +18,12 @@ _MAP_HUD_MARGIN_PX = 12
 # The layout now measures the rail instead, so this is only used before the
 # rail exists. Do not go back to arithmetic here; the two drift apart every
 # time a button is added.
-_MAP_ACTION_RAIL_HEIGHT_PX = 56 + 8 + 56 + 8 + 36 + 8 + 56 + 8 + 36
+# Five buttons of 50 px, 3 px apart, 5 px padding (ui_theme.FLIGHT_*, 2026-11-09 restyle).
+_MAP_ACTION_RAIL_HEIGHT_PX = 5 * 50 + 4 * 3 + 2 * 5
 _OBSTACLE_PANEL_TOP_PX = _MAP_ACTION_RAIL_TOP_PX + _MAP_ACTION_RAIL_HEIGHT_PX + 8
 _OBSTACLE_PANEL_MAX_H_PX = 360
 
-# Native camera rail geometry (shared by map_widget QSS and NativeHudLayoutMixin).
-_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX = 318
-_CAM_RAIL_LAYER_INSET = (5, 5, 14, 5)
-_NATIVE_CAM_RAIL_MIN_WIDTH_PX = (
-    _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX
-    + _CAM_RAIL_LAYER_INSET[0]
-    + _CAM_RAIL_LAYER_INSET[2]
-)
-_CAM_RAIL_PAD_BTN_H = 34
-_CAM_RAIL_PAD_BTN_W = 42
-_CAM_RAIL_LENS_ROW_H = 40
-_CAM_RAIL_LENS_BTN_H = 34
-_CAM_RAIL_LAYOUT_SPACING = 5
-_CAM_RAIL_GIMBAL_GRID_GAP = 5
+# The camera panels take their sizes from vgcs/app/ui_theme.py (2026-11-09 restyle).
 
 # Fixed mini-video PiP (bottom-left).
 _MINI_VIDEO_PIP_W_PX = 236

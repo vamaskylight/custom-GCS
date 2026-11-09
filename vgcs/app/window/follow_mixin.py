@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from vgcs.app import follow_guide as fg
+from vgcs.app import ui_theme
 from vgcs.app.flight_action_dialogs import confirm_follow, follow_message
 from vgcs.app.follow_drone import LinkFollowDrone
 from vgcs.app.object_follow import ObjectFollow
@@ -109,7 +110,7 @@ class MainWindowFollowMixin:
             "started."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
         grid.addWidget(hint, 2, 0, 1, 2)
         grid.setColumnStretch(1, 1)
         group.setLayout(grid)

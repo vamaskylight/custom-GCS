@@ -62,6 +62,7 @@ from vgcs.app.window.helpers import (
     _settings_truthy,
 )
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app import ui_theme
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
@@ -141,31 +142,8 @@ class MainWindowMapChromeMixin:
             anchor_pos = None
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
-        menu.setStyleSheet(
-            "QMenu {"
-            " background-color: #f4f4f4;"
-            " color: #222222;"
-            " border: 1px solid #8f8f8f;"
-            " border-radius: 6px;"
-            " padding: 8px 6px;"
-            " }"
-            "QMenu::item {"
-            " background-color: #e9e9e9;"
-            " margin: 4px 4px;"
-            " padding: 10px 16px 10px 40px;"
-            " border-radius: 2px;"
-            " }"
-            "QMenu::item:selected {"
-            " background-color: #dddddd;"
-            " color: #111111;"
-            " }"
-            "QMenu::icon { left: 12px; }"
-            "QMenu::separator {"
-            " height: 1px;"
-            " margin: 6px 8px;"
-            " background: #bfbfbf;"
-            " }"
-        )
+        # Dark like the rest of the window (it was a light grey menu until the 2026-11-09 restyle).
+        menu.setStyleSheet(ui_theme.menu_qss())
 
         action_plan = menu.addAction("Plan Flight")
         action_plan.setToolTip("Mission planning and waypoint management")

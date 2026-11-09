@@ -20,11 +20,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vgcs.app import ui_theme
 from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED
 
 
 class CamRailShowHandle(QFrame):
-    """Edge drawer tab — shown when the operator collapses the camera rail."""
+    """Edge tab — shown when the operator hides the camera panels; a click shows them again."""
 
     WIDTH_PX = 36
     HEIGHT_PX = 92
@@ -38,38 +39,33 @@ class CamRailShowHandle(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Show camera panel")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
             "QFrame#camRailShowHandle {"
-            " background: rgba(24, 30, 40, 0.96);"
-            " border: 1px solid rgba(196, 209, 230, 90);"
-            " border-right: none;"
-            " border-top-left-radius: 12px;"
-            " border-bottom-left-radius: 12px;"
+            f" background-color: {ui_theme.OVERLAY_CARD}; border: 1px solid {ui_theme.OVERLAY_BORDER};"
+            " border-right: none; border-top-left-radius: 16px; border-bottom-left-radius: 16px;"
             "}"
             "QFrame#camRailShowHandle:hover {"
-            " background: rgba(46, 56, 72, 0.98);"
-            " border-color: rgba(229, 237, 251, 130);"
+            f" background-color: {ui_theme.OVERLAY_BUTTON_HOVER}; border-color: {ui_theme.OVERLAY_BORDER_HOVER};"
             "}"
-            "QLabel#camRailShowChevron {"
-            " color: #dce5f5; font-size: 15px; font-weight: 700;"
-            " background: transparent; border: none;"
-            "}"
+            "QLabel { background: transparent; border: none; }"
         )
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 14, 0, 12)
-        lay.setSpacing(8)
+        lay.setSpacing(10)
         lay.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         icon_lbl = QLabel()
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_lbl.setFixedSize(22, 22)
         if icon is not None and not icon.isNull():
             icon_lbl.setPixmap(icon.pixmap(22, 22))
-        else:
-            icon_lbl.setText("🎥")
-            icon_lbl.setStyleSheet("font-size: 16px; background: transparent; border: none;")
-        chev = QLabel("◀")
+        chev = QLabel()
         chev.setObjectName("camRailShowChevron")
         chev.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        chev.setFixedSize(18, 18)
+        chevron = ui_theme.icon("arrow_left", 18)
+        if not chevron.isNull():
+            chev.setPixmap(chevron.pixmap(18, 18))
         lay.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(chev, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addStretch(1)
@@ -80,85 +76,6 @@ class CamRailShowHandle(QFrame):
             event.accept()
             return
         super().mouseReleaseEvent(event)
-
-
-class CamRecordArch(QWidget):
-    """Legacy arched record mount — prefer ``CamRecordTimerRow`` for compact rail."""
-
-    def __init__(self, record_btn: QWidget, parent=None) -> None:
-        super().__init__(parent)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        self._arch = QFrame()
-        self._arch.setObjectName("camRecordArch")
-        inner = QVBoxLayout(self._arch)
-        inner.setContentsMargins(3, 2, 3, 2)
-        inner.setSpacing(0)
-        inner.addWidget(record_btn, 0, Qt.AlignmentFlag.AlignHCenter)
-        lay.addWidget(self._arch)
-
-
-class CamRecordTimerRow(QWidget):
-    """Shutter + elapsed timer on one row (saves vertical space vs stacked arch + timer)."""
-
-    def __init__(self, record_btn: QWidget, timer_lbl: QWidget, parent=None) -> None:
-        super().__init__(parent)
-        self.setObjectName("camRecordTimerRow")
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 2, 0, 2)
-        lay.setSpacing(8)
-        lay.addStretch(1)
-        lay.addWidget(record_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(timer_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addStretch(1)
-
-
-class CamRailGimbalPad(QWidget):
-    """2×3 gimbal pad: [← ↑ →] / [⌂ ↓ 90°]."""
-
-    def __init__(
-        self,
-        buttons: list[list[QWidget]],
-        parent=None,
-        *,
-        btn_height: int = 30,
-        btn_width: int = 40,
-        grid_gap: int = 4,
-    ) -> None:
-        super().__init__(parent)
-        from PySide6.QtWidgets import QGridLayout
-
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        lay = QGridLayout(self)
-        # Right padding keeps 1px borders inside the widget (avoids → / 90° clip).
-        lay.setContentsMargins(0, 0, 4, 2)
-        lay.setHorizontalSpacing(int(grid_gap))
-        lay.setVerticalSpacing(int(grid_gap))
-        cols = max((len(row) for row in buttons), default=0)
-        rows = len(buttons)
-        for row, row_btns in enumerate(buttons):
-            for col, btn in enumerate(row_btns):
-                lay.addWidget(btn, row, col, Qt.AlignmentFlag.AlignCenter)
-        lay.activate()
-        # Explicit size from button geometry + padding — layout minimumSize can be too small.
-        pad_w = (
-            int(cols) * int(btn_width)
-            + max(0, int(cols) - 1) * int(grid_gap)
-            + lay.contentsMargins().left()
-            + lay.contentsMargins().right()
-        )
-        pad_h = (
-            int(rows) * int(btn_height)
-            + max(0, int(rows) - 1) * int(grid_gap)
-            + lay.contentsMargins().top()
-            + lay.contentsMargins().bottom()
-        )
-        sh = lay.sizeHint()
-        self.setFixedSize(
-            max(pad_w, sh.width()),
-            max(pad_h, sh.height()),
-        )
 
 
 class CamObserveBlock(QWidget):
@@ -336,30 +253,41 @@ class CamObserveBlock(QWidget):
 
 
 class CamM13TrackBlock(QWidget):
-    """M13 moving-target track — arm, click video, gimbal follow."""
+    """M13 moving-target track and Follow Me: two named pills in the camera bar.
+
+    Track arms the visual track (click the target on the video, the gimbal follows it). Follow makes
+    the DRONE follow the tracked object, so it keeps its name rather than an icon alone. The words of
+    the old hint line are in Track's tooltip.
+    """
 
     def __init__(self, track_btn: QWidget, follow_btn: QWidget | None = None, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("m13TrackBlock")
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(4)
+        v.setSpacing(6)
+        track_btn.setParent(self)
         track_btn.setObjectName("m13Track")
         track_btn.setToolTip(
             "Arm visual track — click a target on the day video feed. "
-            "C13 firmware follows via GOT+SUM; map coords computed in GCS."
+            "C13 firmware follows via GOT+SUM; map coords computed in GCS.\n"
+            "Track ON, then click the target on the video: the gimbal follows it and the map draws its trail."
         )
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
-        row.addWidget(track_btn, 1)
+        _pill(track_btn, "vama_lock")
+        v.addWidget(track_btn)
         if follow_btn is not None:
-            # Follow Me beside Track, in the same row: the rail does not scroll, and has no height to spare.
-            row.addWidget(follow_btn, 1)
-        hint = QLabel("Track ON → click target on video · gimbal follow · map trail")
-        hint.setObjectName("m13TrackHint")
-        hint.setWordWrap(True)
-        v.addLayout(row)
-        v.addWidget(hint)
+            # Follow Me under Track, in the same block: shown and hidden with it.
+            follow_btn.setParent(self)
+            _pill(follow_btn, "vama_follow")
+            v.addWidget(follow_btn)
+
+
+def _pill(btn: QWidget, icon_name: str) -> None:
+    """A named pill of the camera panels: icon, name, the panels' sheet gives its look."""
+    btn.setIcon(ui_theme.icon(icon_name, 16))
+    btn.setIconSize(QSize(16, 16))
+    btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
 class CamRailBiSlider(QWidget):

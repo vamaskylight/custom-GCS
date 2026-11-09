@@ -1,6 +1,18 @@
-"""Shared Qt stylesheet for VGCS (dark GCS-style shell)."""
+"""Shared Qt stylesheet for VGCS: the windows and dialogs in the Vama GCS app's dark look.
+
+The colours are QGC's dark palette from ``vgcs/app/ui_theme.py`` (2026-11-09
+restyle, the developer's "make the PC version look like the app"). Until then
+this sheet had its own blue-grey colours, and several windows drew light menus
+and boxes of their own.
+"""
+
+from __future__ import annotations
 
 import re
+import tempfile
+from pathlib import Path
+
+from vgcs.app import ui_theme as t
 
 
 def _scale_px(css: str, scale: float) -> str:
@@ -15,254 +27,465 @@ def _scale_px(css: str, scale: float) -> str:
     return re.sub(r"(\d+(?:\.\d+)?)px", repl, css)
 
 
+def _arrow_image_url(name: str, px: int = 12, color: str = t.TEXT_DIM) -> str:
+    """A small arrow as a PNG file for the sheet's ``image:`` rules ("" when it cannot be made).
+
+    PNG, not the SVG itself: an SVG in a style sheet needs Qt's SVG image plugin,
+    which a packaged build might not carry. The arrows are drawn by QtSvg into a
+    cache folder once per start.
+    """
+    try:
+        pm = t.icon_pixmap(name, px, color)
+        if pm.isNull():
+            return ""
+        folder = Path(tempfile.gettempdir()) / "vgcs-ui-cache"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}-{px}-{color.strip('#')}.png"
+        if not path.is_file() and not pm.save(str(path), "PNG"):
+            return ""
+        return path.as_posix()
+    except OSError:  # no writable temp folder: Fusion's own arrows then
+        return ""
+
+
 def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> str:
-    """Fusion-friendly QSS: palette inspired by common GCS dark UIs (~#252a35 / #2c313c)."""
-    css = """
-    QMainWindow, QWidget#centralRoot, QWidget#contentRoot, QWidget#contentViewport, QDialog, QDialog QWidget {
-        background-color: #1a1d24;
-        color: #e8eaef;
-    }
-    QLabel {
-        color: #dbe1ee;
-    }
-    QScrollArea, QAbstractScrollArea {
-        background-color: #1a1d24;
+    """Fusion-friendly QSS in QGC's dark colours, for the main window and every dialog."""
+    down = _arrow_image_url("arrow_down")
+    up = _arrow_image_url("arrow_up")
+    # The list and number boxes' own arrows, in the theme's grey. Only when both pictures could be
+    # made: a styled arrow without its picture is no arrow at all, while Fusion's own still shows.
+    arrows = ""
+    if down and up:
+        arrows = f"""
+    QComboBox {{
+        padding-right: 28px;
+    }}
+    QComboBox::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: center right;
+        width: 24px;
         border: none;
-    }
-    QScrollArea > QWidget > QWidget {
-        background-color: #1a1d24;
-    }
-    QGroupBox {
+        background: transparent;
+    }}
+    QComboBox::down-arrow {{
+        image: url("{down}");
+        width: 12px;
+        height: 12px;
+    }}
+    QSpinBox, QDoubleSpinBox {{
+        padding-right: 22px;
+    }}
+    QSpinBox::up-button, QDoubleSpinBox::up-button {{
+        subcontrol-origin: border;
+        subcontrol-position: top right;
+        width: 20px;
+        border: none;
+        background: transparent;
+    }}
+    QSpinBox::down-button, QDoubleSpinBox::down-button {{
+        subcontrol-origin: border;
+        subcontrol-position: bottom right;
+        width: 20px;
+        border: none;
+        background: transparent;
+    }}
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+        image: url("{up}");
+        width: 10px;
+        height: 10px;
+    }}
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+        image: url("{down}");
+        width: 10px;
+        height: 10px;
+    }}
+"""
+    css = f"""
+    QMainWindow, QWidget#centralRoot, QWidget#contentRoot, QWidget#contentViewport, QDialog {{
+        background-color: {t.WINDOW};
+        color: {t.TEXT};
+    }}
+    QDialog QWidget {{
+        color: {t.TEXT};
+    }}
+    QDialog QScrollArea, QDialog QScrollArea > QWidget > QWidget, QDialog QStackedWidget,
+    QDialog QTabWidget > QWidget {{
+        background-color: transparent;
+    }}
+    QLabel {{
+        color: {t.TEXT};
+        background-color: transparent;
+    }}
+    QScrollArea, QAbstractScrollArea {{
+        background-color: {t.WINDOW};
+        border: none;
+    }}
+    QScrollArea > QWidget > QWidget {{
+        background-color: {t.WINDOW};
+    }}
+    QGroupBox {{
         font-weight: 600;
-        font-size: 13px;
-        color: #c9d2e8;
-        border: 1px solid #343b4d;
-        border-radius: 8px;
+        font-size: {t.FONT_BODY}px;
+        color: {t.TEXT};
+        border: 1px solid {t.BORDER};
+        border-radius: {t.RADIUS}px;
         margin-top: 14px;
         padding: 16px 12px 12px 12px;
-        background-color: #22262f;
-    }
-    QGroupBox::title {
+        background-color: {t.WINDOW_SHADE};
+    }}
+    QGroupBox::title {{
         subcontrol-origin: margin;
         subcontrol-position: top left;
-        left: 14px;
-        padding: 0 8px;
-        color: #a8b0c4;
-    }
-    QLabel#headerTitle {
-        font-size: 22px;
+        left: 12px;
+        padding: 0 6px;
+        color: {t.TEXT_DIM};
+    }}
+    QLabel#headerTitle {{
+        font-size: {t.FONT_TITLE}px;
         font-weight: 700;
-        color: #f0f2f7;
-        letter-spacing: 0.5px;
-    }
-    QLabel#headerSubtitle {
-        font-size: 12px;
-        color: #7d869c;
-    }
-    QLabel#telemetryValue {
+        color: {t.TEXT};
+    }}
+    QLabel#headerSubtitle {{
+        font-size: {t.FONT_BODY}px;
+        color: {t.TEXT_DIM};
+    }}
+    QLabel#telemetryValue {{
         font-family: "__MONO_FAMILY__", "Consolas", "Courier New", monospace;
-        font-size: 13px;
-        color: #dce1ef;
-    }
-    /*
-     * Legacy Web map #linkBanner + .hdrPill + .hdrSep (git e48c1a7 map_widget.py):
-     *   #linkBanner: rgba(24,30,40,0.95); border-bottom rgba(72,86,110,0.9); padding 8px 12px
-     *   #linkBannerConnected: gap 12px; font 14px weight 600; color #f4f7ff
-     *   .hdrPill: inline-flex, NO boxed background (flat on the tinted banner)
-     *   .hdrSep: 1x24px rgba(210,220,240,0.55)
-     *   setFlightStatus tints the FULL banner rgba + text color (green/yellow/red)
-     * Non-map panels still use statusChip below.
-     */
-    QLabel#statusChipTitle {
-        font-size: 11px;
+        font-size: {t.FONT_BODY}px;
+        color: {t.TEXT};
+    }}
+    QLabel#statusChipTitle {{
+        font-size: {t.FONT_SMALL}px;
         font-weight: 600;
-        color: #9ca3b0;
+        color: {t.TEXT_DIM};
         text-transform: uppercase;
-        letter-spacing: 0.08em;
-    }
-    QLabel#statusChipValue {
-        font-size: 13px;
+    }}
+    QLabel#statusChipValue {{
+        font-size: {t.FONT_BODY}px;
         font-weight: 600;
-        color: #f3f4f6;
-    }
-    QFrame#statusChip {
-        background-color: rgba(45, 45, 58, 0.96);
-        border: 1px solid rgba(72, 86, 110, 0.75);
-        border-radius: 8px;
+        color: {t.TEXT};
+    }}
+    QFrame#statusChip, QFrame#vehicleMsgPanel {{
+        background-color: {t.WINDOW_SHADE};
+        border: 1px solid {t.BORDER};
+        border-radius: {t.RADIUS}px;
         padding: 0px;
-    }
-    QFrame#statusChip:hover {
-        border-color: rgba(92, 106, 130, 0.9);
-        background-color: rgba(52, 52, 64, 0.96);
-    }
-    QFrame#vehicleMsgPanel {
-        background-color: rgba(45, 45, 58, 0.96);
-        border: 1px solid rgba(72, 86, 110, 0.75);
-        border-radius: 8px;
-    }
-    QWidget#hdrPill {
+    }}
+    QWidget#hdrPill {{
         background-color: transparent;
         border: none;
-    }
-    QLabel#hdrPillTitle {
-        font-size: 10px;
+    }}
+    QLabel#hdrPillTitle {{
+        font-size: {t.FONT_SMALL}px;
         font-weight: 600;
-        color: rgba(244, 247, 255, 0.55);
+        color: rgba(255, 255, 255, 140);
         text-transform: uppercase;
-        letter-spacing: 0.06em;
-    }
-    QLabel#hdrPillValue {
-        font-size: 14px;
+    }}
+    QLabel#hdrPillValue {{
+        font-size: {t.FONT_MEDIUM}px;
         font-weight: 600;
-        color: #f4f7ff;
-    }
-    QLabel#hdrGpsStackLine {
-        font-size: 12px;
+        color: {t.TEXT};
+    }}
+    QLabel#hdrGpsStackLine {{
+        font-size: {t.FONT_BODY}px;
         font-weight: 600;
-        color: #f4f7ff;
-        line-height: 1.05;
-    }
-    QPushButton#hdrMapModeBtn {
-        margin-left: 8px;
-        min-width: 62px;
-        height: 26px;
-        border-radius: 13px;
-        border: 1px solid rgba(210, 220, 240, 0.65);
-        background-color: rgba(20, 30, 42, 0.7);
-        color: #f1f6ff;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.02em;
-        padding: 0 10px;
-    }
-    QPushButton#hdrMapModeBtn:hover {
-        background-color: rgba(36, 50, 69, 0.9);
-    }
-    QFrame#hdrSep {
-        background-color: rgba(210, 220, 240, 0.55);
+        color: {t.TEXT};
+    }}
+    QFrame#hdrSep {{
+        background-color: rgba(255, 255, 255, 60);
         border: none;
         max-width: 1px;
         min-width: 1px;
         min-height: 24px;
         max-height: 28px;
-    }
-    QFrame#headerBar {
-        background-color: rgba(24, 30, 40, 0.96);
-        border-bottom: 1px solid rgba(72, 86, 110, 0.9);
+    }}
+    QFrame#headerBar {{
+        background-color: {t.WINDOW};
+        border-bottom: 1px solid rgba(255, 255, 255, 40);
         border-radius: 0px;
-    }
-    QScrollArea#headerChipScroll {
+    }}
+    QScrollArea#headerChipScroll {{
         background-color: transparent;
         border: none;
-    }
-    QScrollArea#headerChipScroll > QWidget > QWidget {
+    }}
+    QScrollArea#headerChipScroll > QWidget > QWidget {{
         background-color: transparent;
-    }
-    QScrollArea#headerChipScroll QScrollBar:horizontal {
-        background: #1a1f2a;
-        height: 6px;
-        border-radius: 3px;
+    }}
+    QScrollArea#headerChipScroll QScrollBar:horizontal {{
+        background: transparent;
+        height: 5px;
+        border-radius: 2px;
         margin: 0 0 2px 0;
-    }
-    QScrollArea#headerChipScroll QScrollBar::handle:horizontal {
-        background: #4a5568;
+    }}
+    QScrollArea#headerChipScroll QScrollBar::handle:horizontal {{
+        background: rgba(255, 255, 255, 90);
         min-width: 24px;
-        border-radius: 3px;
-    }
-    /* Flight/arm control: flat text on tinted banner (Web setFlightStatus — no separate red box). */
-    QPushButton#headerFlightChipBtn {
+        border-radius: 2px;
+    }}
+    QPushButton#headerFlightChipBtn {{
         background-color: transparent;
-        color: #dbe3f3;
+        color: {t.TEXT};
         border: none;
         border-radius: 0px;
         padding: 2px 4px;
         font-weight: 700;
-        font-size: 14px;
+        font-size: {t.FONT_MEDIUM}px;
         min-height: 22px;
-    }
-    QPushButton#headerFlightChipBtn:hover {
-        background-color: rgba(255, 255, 255, 0.06);
-    }
-    QPushButton#headerFlightChipBtn:pressed {
-        background-color: rgba(255, 255, 255, 0.1);
-    }
-    QMenu {
-        background-color: #1e2430;
-        color: #e8edf9;
-        border: 1px solid #3d465a;
-        border-radius: 8px;
+    }}
+    QPushButton#headerFlightChipBtn:hover {{
+        background-color: rgba(255, 255, 255, 15);
+    }}
+    QMenu {{
+        background-color: {t.WINDOW_SHADE};
+        color: {t.TEXT};
+        border: 1px solid {t.BORDER};
+        border-radius: {t.RADIUS}px;
         padding: 6px 4px;
-    }
-    QMenu::item {
-        padding: 8px 28px 8px 16px;
+    }}
+    QMenu::item {{
+        padding: 8px 28px 8px 14px;
         border-radius: 4px;
-    }
-    QMenu::item:selected {
-        background-color: #2d3a52;
-        color: #f0f4ff;
-    }
-    QMenu::separator {
+        background-color: transparent;
+    }}
+    QMenu::item:selected {{
+        background-color: {t.HIGHLIGHT};
+        color: {t.TEXT};
+    }}
+    QMenu::item:disabled {{
+        color: {t.TEXT_FAINT};
+    }}
+    QMenu::separator {{
         height: 1px;
         margin: 6px 10px;
-        background-color: #3d465a;
-    }
-    QLineEdit, QTextEdit, QComboBox, QDoubleSpinBox {
-        background-color: #1e222b;
-        color: #e8edf9;
-        border: 1px solid #3d465a;
+        background-color: {t.BORDER};
+    }}
+    QToolTip {{
+        background-color: {t.WINDOW_SHADE};
+        color: {t.TEXT};
+        border: 1px solid {t.BORDER_STRONG};
+        border-radius: 4px;
+        padding: 6px 8px;
+    }}
+    QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateTimeEdit, QTimeEdit {{
+        background-color: {t.WINDOW_SHADE_DARK};
+        color: {t.TEXT};
+        border: 1px solid {t.BORDER};
         border-radius: 6px;
         padding: 6px 10px;
-        selection-background-color: #3d6fb8;
-    }
-    QLineEdit::placeholder, QTextEdit::placeholder {
-        color: #7f88a0;
-    }
-    QComboBox QAbstractItemView {
-        background-color: #202531;
-        color: #e8edf9;
-        selection-background-color: #3d6fb8;
-    }
-    QAbstractSpinBox {
-        color: #e8edf9;
-    }
-    QPushButton {
-        background-color: #2d3545;
-        color: #e8edf9;
-        border: 1px solid #4a5570;
+        selection-background-color: {t.HIGHLIGHT};
+        selection-color: {t.TEXT};
+    }}
+    QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus,
+    QDoubleSpinBox:focus {{
+        border: 1px solid {t.HIGHLIGHT};
+    }}
+    QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QTextEdit:disabled {{
+        color: {t.TEXT_FAINT};
+        background-color: {t.WINDOW};
+        border-color: #3a3a3a;
+    }}
+    QLineEdit::placeholder, QTextEdit::placeholder {{
+        color: {t.TEXT_FAINT};
+    }}
+    QComboBox QAbstractItemView {{
+        background-color: {t.WINDOW_SHADE};
+        color: {t.TEXT};
+        border: 1px solid {t.BORDER};
+        selection-background-color: {t.HIGHLIGHT};
+        selection-color: {t.TEXT};
+        outline: none;
+    }}
+    {arrows}
+    QAbstractSpinBox {{
+        color: {t.TEXT};
+    }}
+    QPushButton, QToolButton {{
+        background-color: {t.BUTTON};
+        color: {t.TEXT};
+        border: 1px solid {t.BUTTON_BORDER};
         border-radius: 6px;
-        padding: 8px 16px;
+        padding: 7px 16px;
         font-weight: 600;
         min-height: 20px;
-    }
-    QPushButton:hover {
-        background-color: #384056;
-        border-color: #5c6a8a;
-    }
-    QPushButton:pressed {
-        background-color: #252b38;
-    }
-    QPushButton:disabled {
-        color: #8d97b2;
-        border-color: #353b4a;
-        background-color: #283042;
-    }
-    QSplitter::handle {
-        background-color: #2c3344;
+    }}
+    QPushButton:hover, QToolButton:hover {{
+        background-color: {t.BUTTON_HOVER};
+        border-color: #6c6c78;
+    }}
+    QPushButton:pressed, QToolButton:pressed {{
+        background-color: {t.BUTTON_PRESSED};
+    }}
+    QPushButton:checked, QToolButton:checked {{
+        background-color: {t.HIGHLIGHT};
+        border-color: {t.HIGHLIGHT_HOVER};
+        color: {t.TEXT};
+    }}
+    QPushButton:default {{
+        border: 1px solid {t.HIGHLIGHT};
+    }}
+    QPushButton:disabled, QToolButton:disabled {{
+        color: {t.TEXT_FAINT};
+        border-color: #3a3a40;
+        background-color: #2c2c31;
+    }}
+    QCheckBox, QRadioButton {{
+        color: {t.TEXT};
+        spacing: 8px;
+        background-color: transparent;
+    }}
+    QCheckBox:disabled, QRadioButton:disabled {{
+        color: {t.TEXT_FAINT};
+    }}
+    QCheckBox::indicator, QRadioButton::indicator {{
+        width: 16px;
+        height: 16px;
+        border: 1px solid {t.BORDER_STRONG};
+        background-color: {t.WINDOW_SHADE_DARK};
+    }}
+    QCheckBox::indicator {{
+        border-radius: 3px;
+    }}
+    QRadioButton::indicator {{
+        border-radius: 8px;
+    }}
+    QCheckBox::indicator:checked {{
+        background-color: {t.HIGHLIGHT};
+        border-color: {t.HIGHLIGHT};
+    }}
+    QRadioButton::indicator:checked {{
+        background-color: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+            stop:0 {t.TEXT}, stop:0.35 {t.TEXT}, stop:0.45 {t.HIGHLIGHT}, stop:1 {t.HIGHLIGHT});
+        border-color: {t.HIGHLIGHT};
+    }}
+    QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
+        border-color: {t.HIGHLIGHT};
+    }}
+    QTabWidget::pane {{
+        border: 1px solid {t.BORDER};
+        border-radius: {t.RADIUS}px;
+        background-color: {t.WINDOW};
+        top: -1px;
+    }}
+    QTabBar::tab {{
+        background-color: {t.WINDOW_SHADE};
+        color: {t.TEXT_DIM};
+        border: 1px solid {t.BORDER};
+        border-bottom: none;
+        padding: 8px 16px;
+        margin-right: 2px;
+        border-top-left-radius: 6px;
+        border-top-right-radius: 6px;
+    }}
+    QTabBar::tab:selected {{
+        background-color: {t.WINDOW};
+        color: {t.TEXT};
+        border-color: {t.HIGHLIGHT};
+    }}
+    QTabBar::tab:hover:!selected {{
+        color: {t.TEXT};
+    }}
+    QListWidget, QListView, QTreeWidget, QTreeView, QTableWidget, QTableView {{
+        background-color: {t.WINDOW_SHADE_DARK};
+        alternate-background-color: #2e2e2e;
+        color: {t.TEXT};
+        border: 1px solid {t.BORDER};
+        border-radius: 6px;
+        selection-background-color: {t.HIGHLIGHT};
+        selection-color: {t.TEXT};
+        gridline-color: #3a3a3a;
+        outline: none;
+    }}
+    QListWidget::item, QListView::item {{
+        padding: 6px 8px;
+        border-radius: 4px;
+    }}
+    QListWidget::item:selected, QListView::item:selected {{
+        background-color: {t.HIGHLIGHT};
+        color: {t.TEXT};
+    }}
+    QHeaderView::section {{
+        background-color: {t.WINDOW_SHADE};
+        color: {t.TEXT_DIM};
+        border: none;
+        border-right: 1px solid {t.BORDER};
+        border-bottom: 1px solid {t.BORDER};
+        padding: 6px 8px;
+        font-weight: 600;
+    }}
+    QTableCornerButton::section {{
+        background-color: {t.WINDOW_SHADE};
+        border: none;
+    }}
+    QProgressBar {{
+        background-color: {t.WINDOW_SHADE_DARK};
+        border: 1px solid {t.BORDER};
+        border-radius: 6px;
+        color: {t.TEXT};
+        text-align: center;
+        min-height: 16px;
+    }}
+    QProgressBar::chunk {{
+        background-color: {t.HIGHLIGHT};
+        border-radius: 5px;
+    }}
+    QSlider::groove:horizontal {{
         height: 4px;
-    }
-    QTextEdit {
+        background: {t.BORDER};
+        border-radius: 2px;
+    }}
+    QSlider::handle:horizontal {{
+        width: 16px;
+        height: 16px;
+        margin: -6px 0;
+        border-radius: 8px;
+        background: {t.HIGHLIGHT};
+    }}
+    QSplitter::handle {{
+        background-color: {t.BORDER};
+        height: 4px;
+    }}
+    QTextEdit, QPlainTextEdit {{
         font-family: "__MONO_FAMILY__", "Consolas", "Courier New", monospace;
         font-size: 12px;
-    }
-    QScrollBar:vertical {
-        background: #1e222b;
-        width: 5px;
+    }}
+    QScrollBar:vertical {{
+        background: transparent;
+        width: 8px;
         margin: 0;
-    }
-    QScrollBar::handle:vertical {
-        background: #4a5568;
-        min-height: 20px;
-        border-radius: 3px;
-    }
+    }}
+    QScrollBar::handle:vertical {{
+        background: rgba(255, 255, 255, 70);
+        min-height: 24px;
+        border-radius: 4px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: rgba(255, 255, 255, 120);
+    }}
+    QScrollBar:horizontal {{
+        background: transparent;
+        height: 8px;
+        margin: 0;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: rgba(255, 255, 255, 70);
+        min-width: 24px;
+        border-radius: 4px;
+    }}
+    QScrollBar::add-line, QScrollBar::sub-line {{
+        width: 0px;
+        height: 0px;
+        border: none;
+        background: transparent;
+    }}
+    QScrollBar::add-page, QScrollBar::sub-page {{
+        background: transparent;
+    }}
+    QMessageBox {{
+        background-color: {t.WINDOW};
+    }}
+    QMessageBox QLabel {{
+        color: {t.TEXT};
+        font-size: {t.FONT_BODY}px;
+    }}
     """.replace("__MONO_FAMILY__", mono_family)
     return _scale_px(css, ui_scale)

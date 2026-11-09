@@ -18,3 +18,5 @@ _KEY_PLAN_CURRENT_MISSION_JSON = "plan_current_mission_json"
 _KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fallback only
 
 _KEY_TOOLBAR_EXPORT_MISSION_JSON = "toolbar_export_mission_json"
+# The Observe panel beside the camera bar is open (2026-11-09 restyle): it stays as the operator left it.
+_KEY_OBSERVE_PANEL_OPEN = "camera/observe_panel_open"

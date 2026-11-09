@@ -62,6 +62,7 @@ from vgcs.app.window.helpers import (
     _settings_truthy,
 )
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app import ui_theme
 from vgcs.app.obstacle_setup import summary as obstacle_summary
 from vgcs.app.obstacle_setup_dialog import ObstacleSetupDialog
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
@@ -111,57 +112,58 @@ class MainWindowSettingsDialogsMixin:
             # (e.g. default light palette) need an explicit background.
             dlg.setStyleSheet(
                 base
-                + """
-                QDialog#appSettingsDialog, QDialog#appSettingsDialog QWidget {
-                    background-color: #1a1d24;
-                    color: #e8eaef;
-                }
-                QDialog#appSettingsDialog QListWidget {
-                    background-color: #12151c;
-                    border: 1px solid #252d3d;
+                + f"""
+                QDialog#appSettingsDialog {{
+                    background-color: {ui_theme.WINDOW};
+                    color: {ui_theme.TEXT};
+                }}
+                QDialog#appSettingsDialog QListWidget {{
+                    background-color: {ui_theme.WINDOW_SHADE_DARK};
+                    border: 1px solid {ui_theme.BORDER};
                     border-radius: 8px;
                     padding: 6px;
-                }
-                QDialog#appSettingsDialog QListWidget::item {
+                }}
+                QDialog#appSettingsDialog QListWidget::item {{
                     padding: 8px 10px;
                     border-radius: 6px;
-                    color: #dbe1ee;
-                }
-                QDialog#appSettingsDialog QListWidget::item:selected {
-                    background-color: #2d3a52;
-                    color: #f0f4ff;
-                }
-                QDialog#appSettingsDialog QGroupBox {
+                    color: {ui_theme.TEXT};
+                }}
+                QDialog#appSettingsDialog QListWidget::item:selected {{
+                    background-color: {ui_theme.HIGHLIGHT};
+                    color: {ui_theme.TEXT};
+                }}
+                QDialog#appSettingsDialog QGroupBox {{
                     font-weight: 600;
-                    border: 1px solid #2a3344;
+                    background-color: {ui_theme.WINDOW_SHADE};
+                    border: 1px solid {ui_theme.BORDER};
                     border-radius: 8px;
                     margin-top: 14px;
                     padding: 14px 12px 12px 12px;
-                }
-                QDialog#appSettingsDialog QGroupBox::title {
+                }}
+                QDialog#appSettingsDialog QGroupBox::title {{
                     subcontrol-origin: margin;
                     left: 10px;
                     padding: 0 6px;
-                    color: #dbe1ee;
-                }
-                QDialog#appSettingsDialog QScrollArea {
+                    color: {ui_theme.TEXT_DIM};
+                }}
+                QDialog#appSettingsDialog QScrollArea {{
                     background: transparent;
                     border: none;
-                }
+                }}
                 QDialog#appSettingsDialog QLineEdit,
                 QDialog#appSettingsDialog QComboBox,
                 QDialog#appSettingsDialog QSpinBox,
-                QDialog#appSettingsDialog QDoubleSpinBox {
-                    background-color: #12151c;
-                    border: 1px solid #252d3d;
+                QDialog#appSettingsDialog QDoubleSpinBox {{
+                    background-color: {ui_theme.WINDOW_SHADE_DARK};
+                    border: 1px solid {ui_theme.BORDER};
                     border-radius: 6px;
                     padding: 6px 8px;
                     min-height: 28px;
-                }
+                }}
                 QDialog#appSettingsDialog QRadioButton,
-                QDialog#appSettingsDialog QCheckBox {
+                QDialog#appSettingsDialog QCheckBox {{
                     spacing: 8px;
-                }
+                }}
                 """
             )
         except Exception:
@@ -218,7 +220,7 @@ class MainWindowSettingsDialogsMixin:
             "Silence alarm. It also counts for the links that run now."
         )
         link_hint.setWordWrap(True)
-        link_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        link_hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
         lg.addWidget(link_hint, 1, 0, 1, 2)
         lg.setColumnStretch(1, 1)
         link_group.setLayout(lg)
@@ -242,7 +244,7 @@ class MainWindowSettingsDialogsMixin:
             "This is a warning on this screen only. The failsafe that brings the drone home runs on the drone."
         )
         wind_hint.setWordWrap(True)
-        wind_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        wind_hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
         wg.addWidget(wind_hint, 1, 0, 1, 2)
         wg.setColumnStretch(1, 1)
         wind_group.setLayout(wg)
@@ -262,7 +264,7 @@ class MainWindowSettingsDialogsMixin:
             "with its own position (1005 or 1006). The dashboard shows what arrives under RTK corrections."
         )
         rtk_hint.setWordWrap(True)
-        rtk_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        rtk_hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
         rg.addWidget(rtk_hint, 1, 0, 1, 2)
         rg.setColumnStretch(1, 1)
         rtk_group.setLayout(rg)
@@ -291,7 +293,7 @@ class MainWindowSettingsDialogsMixin:
             hint.setWordWrap(True)
             hint.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+            hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
             return hint
 
         class _ScrollBodyWidthFilter(QObject):
@@ -398,14 +400,14 @@ class MainWindowSettingsDialogsMixin:
         provider_lay.setContentsMargins(10, 8, 10, 8)
         provider_lay.setSpacing(6)
         provider_title = QLabel("Control provider")
-        provider_title.setStyleSheet("font-weight: 600; color: #dbe1ee;")
+        provider_title.setStyleSheet(f"font-weight: 600; color: {ui_theme.TEXT};")
         provider_lay.addWidget(provider_title)
         for rb in (rb_mavlink, rb_siyi, rb_skydroid, rb_viewpro):
             provider_group.addButton(rb)
             provider_lay.addWidget(rb)
         provider_wrap.setStyleSheet(
             "QWidget#cameraProviderWrap {"
-            "background-color: #12151c; border: 1px solid #252d3d; border-radius: 8px;"
+            f"background-color: {ui_theme.WINDOW_SHADE_DARK}; border: 1px solid {ui_theme.BORDER}; border-radius: 8px;"
             "}"
         )
         cam_outer.addWidget(provider_wrap)
@@ -413,7 +415,7 @@ class MainWindowSettingsDialogsMixin:
         camera_hint = _settings_hint("")
         cam_outer.addWidget(camera_hint)
 
-        _hint_style = "color: #c8d0e0; font-size: 12px;"
+        _hint_style = f"color: {ui_theme.TEXT_DIM}; font-size: 12px;"
 
         mavlink_panel = QWidget()
         mavlink_lay = QVBoxLayout(mavlink_panel)
@@ -626,7 +628,7 @@ class MainWindowSettingsDialogsMixin:
             "Absolute zoom/focus level and onboard tracking are not. See DOCS/VIEWPRO-CAMERA-REFERENCE.md."
         )
         viewpro_note.setWordWrap(True)
-        viewpro_note.setStyleSheet("color: #c8d0e0; font-size: 12px;")
+        viewpro_note.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 12px;")
         viewpro_grid.addWidget(viewpro_note, 3, 0, 1, 2)
         viewpro_grid.setColumnStretch(1, 1)
 
@@ -781,7 +783,7 @@ class MainWindowSettingsDialogsMixin:
             "GeoTIFF needs pip install rasterio. Without DEM, flat-ground + drone height is used."
         )
         dem_hint.setWordWrap(True)
-        dem_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        dem_hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
         dg.addWidget(dem_hint, 3, 0, 1, 2)
         dem_group.setLayout(dg)
         ob_l.addWidget(dem_group)
@@ -1076,7 +1078,7 @@ class MainWindowSettingsDialogsMixin:
             "drone's settings are read. A mission read back from the drone is read with these values too."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        hint.setStyleSheet(f"color: {ui_theme.TEXT_DIM}; font-size: 11px;")
         grid.addWidget(hint, 4, 0, 1, 2)
         grid.setColumnStretch(1, 1)
         group.setLayout(grid)
@@ -1157,7 +1159,7 @@ class MainWindowSettingsDialogsMixin:
         can_send = bool(self._thread is not None and self._thread.isRunning())
         if not can_send:
             warn = QLabel("Connect vehicle to enable commands.")
-            warn.setStyleSheet("color: #a8b0c4;")
+            warn.setStyleSheet(f"color: {ui_theme.TEXT_DIM};")
             lay.addWidget(warn)
 
         # Sensor calibration
@@ -1165,7 +1167,7 @@ class MainWindowSettingsDialogsMixin:
         cal_lay = QVBoxLayout()
         cal_lay.setSpacing(6)
         cal_hint = QLabel("Tip: keep the vehicle still unless prompted otherwise.")
-        cal_hint.setStyleSheet("color: #7d869c; font-weight: 400;")
+        cal_hint.setStyleSheet(f"color: {ui_theme.TEXT_FAINT}; font-weight: 400;")
         cal_lay.addWidget(cal_hint)
 
         cal_btn_row1 = QHBoxLayout()

@@ -12,6 +12,7 @@ from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QLabel, QMenu
 
+from vgcs.app import ui_theme
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer
 from vgcs.map.surface.constants import (
     _MAP_HUD_MARGIN_PX,
@@ -571,11 +572,11 @@ class VideoPreviewUiMixin:
             lab.setText(txt)
             lab.setStyleSheet(
                 "QLabel#nativeVideoPreview {"
-                "background: #0c1018;"
-                "color: #9fb0cc;"
+                "background: rgba(0, 0, 0, 220);"
+                f"color: {ui_theme.TEXT_DIM};"
                 "font: 600 11px \"Segoe UI\", Arial, sans-serif;"
-                "border: 1px solid rgba(206, 220, 242, 0.45);"
-                "border-radius: 8px;"
+                "border: 1px solid rgba(255, 255, 255, 110);"
+                "border-radius: 10px;"
                 "}"
             )
         elif not on:
@@ -619,7 +620,7 @@ class VideoPreviewUiMixin:
                     "background: #000;"
                     "color: #e6c07b;"
                     "border: none;"
-                    "border-left: 1px solid rgba(206, 220, 242, 0.55);"
+                    "border-left: 1px solid rgba(255, 255, 255, 110);"
                     "border-radius: 0px;"
                     "}"
                 )
@@ -652,8 +653,8 @@ class VideoPreviewUiMixin:
                     self._native_video_preview.setStyleSheet(
                         "QLabel#nativeVideoPreview {"
                         "background: #000;"
-                        "border: 1px solid rgba(206, 220, 242, 0.55);"
-                        "border-radius: 8px;"
+                        "border: 1px solid rgba(255, 255, 255, 110);"
+                        "border-radius: 10px;"
                         "}"
                     )
             # Done before the geometry so the map has already yielded the
@@ -717,7 +718,9 @@ class VideoPreviewUiMixin:
             self._native_telemetry.show()
             mz = getattr(self, "_native_map_zoom_ctrl", None)
             if mz is not None:
-                mz.show()
+                # While the video fills the view, the small map in the corner has its own + and -,
+                # and the map's own buttons only peeked out from under it (2026-11-09 restyle).
+                mz.setVisible(not bool(getattr(self, "_video_swapped", False)))
         except Exception:
             pass
         if not planning:

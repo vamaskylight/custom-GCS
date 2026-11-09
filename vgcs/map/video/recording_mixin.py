@@ -8,10 +8,11 @@ import time
 
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtCore import QSettings, QSize, QTimer
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
+from vgcs.app import ui_theme
 from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.image_io import save_qimage_to_path
 from vgcs.video.camera_control import NoopCameraControl
@@ -194,10 +195,14 @@ class VideoRecordingMixin:
                 btn.setCheckable(False)
                 btn.setChecked(False)
                 btn.setToolTip("Take photo (shutter)")
+                btn.setIcon(ui_theme.shutter_icon(22))  # a white shutter, like a camera app's
+                btn.setIconSize(QSize(22, 22))
             else:
                 btn.setCheckable(True)
                 btn.setChecked(bool(getattr(self, "_video_recording", False)))
                 btn.setToolTip("Record video")
+                btn.setIcon(ui_theme.record_icon(20))  # a red dot, a white stop square while it records
+                btn.setIconSize(QSize(20, 20))
         finally:
             btn.blockSignals(False)
         self._sync_native_cam_timer_visibility()

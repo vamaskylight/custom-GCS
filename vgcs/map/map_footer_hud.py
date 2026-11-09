@@ -20,17 +20,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vgcs.app import ui_theme
+
 # Shared with native `#cameraRail` QSS in map_widget.py — keep in sync for HUD typography.
-TELEMETRY_STRIP_VALUE_COLOR = "#dce5f5"
+TELEMETRY_STRIP_VALUE_COLOR = "#ffffff"  # the app's white (ui_theme.TEXT)
 TELEMETRY_STRIP_VALUE_STYLE = f"color: {TELEMETRY_STRIP_VALUE_COLOR}; font-size: 15px; font-weight: 600;"
 # A value that is over its warning level (the wind line).
-TELEMETRY_STRIP_WARN_COLOR = "#fbbf24"
+TELEMETRY_STRIP_WARN_COLOR = "#ffb340"  # a warning, readable on the dark strip
 
 
 class TelemetryStripIcon(QWidget):
     """Minimal line-art icons for the telemetry strip (and shared map action rail)."""
 
-    _COLOR = QColor(220, 229, 245)
+    _COLOR = QColor(255, 255, 255)
 
     def __init__(self, kind: str, parent=None, *, icon_size: int | None = None) -> None:
         super().__init__(parent)
@@ -160,15 +162,15 @@ class MapFooterCompass(QWidget):
         outer_r = min(w, h) / 2.0 - 2.0
         inner_r = 76.0
 
-        painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QPointF(cx, cy), outer_r, outer_r)
 
-        painter.setPen(QPen(QColor(148, 160, 180, int(0.32 * 255)), 2))
-        painter.setBrush(QColor(22, 26, 34, int(0.96 * 255)))
+        painter.setPen(QPen(QColor(255, 255, 255, 77), 1.5))
+        painter.setBrush(QColor(0, 0, 0, 150))
         painter.drawEllipse(QPointF(cx, cy), inner_r, inner_r)
 
-        painter.setPen(QPen(QColor(240, 245, 255, int(0.55 * 255)), 1))
+        painter.setPen(QPen(QColor(255, 255, 255, int(0.6 * 255)), 1))
         mb = self._map_bearing_deg
         for tick_deg in range(0, 360, 30):
             rad = math.radians(tick_deg - mb)
@@ -181,7 +183,7 @@ class MapFooterCompass(QWidget):
         font = QFont("Segoe UI", 11)
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor("#f1f5ff"))
+        painter.setPen(QColor("#ffffff"))
         # N/E/W/S on the ring (S was fixed bottom in legacy web; here it rotates with map bearing for 3D parity).
         for text, bearing in (("N", 0), ("E", 90), ("W", 270)):
             rad = math.radians(bearing - mb)
@@ -214,7 +216,7 @@ class MapFooterCompass(QWidget):
 
         # Center pivot (git needle axis).
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#f4f7ff"))
+        painter.setBrush(QColor("#ffffff"))
         painter.drawEllipse(QPointF(cx, cy), 3.5, 3.5)
 
         # Git `#compassInner` (152px) layout: `#compassDeg { bottom: 30px }`, `#cS { bottom: 12px }`
@@ -223,7 +225,7 @@ class MapFooterCompass(QWidget):
         deg_font = QFont("Segoe UI", 13)
         deg_font.setBold(True)
         painter.setFont(deg_font)
-        painter.setPen(QColor("#f4f7ff"))
+        painter.setPen(QColor("#ffffff"))
         deg_h = 22.0
         deg_rect = QRectF(0.0, inner_bottom - 30.0 - deg_h, float(w), deg_h)
         painter.drawText(
@@ -233,7 +235,7 @@ class MapFooterCompass(QWidget):
         )
 
         painter.setFont(font)
-        painter.setPen(QColor("#f1f5ff"))
+        painter.setPen(QColor("#ffffff"))
         rad_s = math.radians(180.0 - mb)
         stx = cx + (inner_r - 22) * math.sin(rad_s) - 5
         sty = cy - (inner_r - 22) * math.cos(rad_s) + 5
@@ -253,9 +255,9 @@ class MapFooterTelemetryStrip(QFrame):
         self.setObjectName("mapTelemetryStrip")
         self.setStyleSheet(
             "QFrame#mapTelemetryStrip {"
-            " background: rgba(26, 33, 45, 215);"
-            " border: 1px solid rgba(80, 92, 118, 107);"
-            " border-radius: 12px;"
+            f" background: {ui_theme.OVERLAY_CARD};"
+            " border: 1px solid rgba(255, 255, 255, 34);"
+            " border-radius: 14px;"
             "}"
         )
         grid = QGridLayout(self)
@@ -359,34 +361,13 @@ def format_map_zoom_level(z: float) -> str:
     return f"z{zf:.1f}"
 
 
-_MAP_ZOOM_BTN_SIDE = 32
+_MAP_ZOOM_BTN_SIDE = 34
 _MAP_ZOOM_BTN_GAP = 4
-_MAP_ZOOM_BTN_QSS = (
-    "QPushButton#mapZoomPlusBtn, QPushButton#mapZoomMinusBtn {"
-    "background-color: rgba(18, 26, 40, 0.88);"
-    "color: #f5f8ff;"
-    "border: 2px solid rgba(200, 218, 255, 0.95);"
-    "border-radius: 6px;"
-    "padding: 0px;"
-    "}"
-    "QPushButton#mapZoomPlusBtn:hover, QPushButton#mapZoomMinusBtn:hover {"
-    "background-color: rgba(32, 46, 68, 0.92);"
-    "border-color: #ffffff;"
-    "color: #ffffff;"
-    "}"
-    "QPushButton#mapZoomPlusBtn:pressed, QPushButton#mapZoomMinusBtn:pressed {"
-    "background-color: rgba(12, 18, 28, 0.95);"
-    "border-color: #9eb6e8;"
-    "}"
+_MAP_ZOOM_PAD = 4
+_MAP_ZOOM_LEVEL_QSS = (
     "QLabel#mapZoomLevelLabel {"
-    "background-color: rgba(18, 26, 40, 0.88);"
-    "color: #f5f8ff;"
-    "border: 2px solid rgba(200, 218, 255, 0.95);"
-    "border-radius: 6px;"
-    "padding: 0px;"
-    "font-family: \"Segoe UI\", \"Roboto\", \"Helvetica Neue\", sans-serif;"
-    "font-size: 13px;"
-    "font-weight: 600;"
+    f" background: transparent; color: {ui_theme.TEXT}; border: none; padding: 0px;"
+    f" font-family: {ui_theme.FONT_FAMILY}; font-size: {ui_theme.FONT_BODY}px; font-weight: 700;"
     "}"
 )
 
@@ -400,48 +381,46 @@ def format_map_zoom_level_display(z: float) -> str:
 
 
 class MapZoomControlPanel(QWidget):
-    """Bottom-left map zoom: stacked + / level / − (matches minimap PiP control chrome)."""
+    """Bottom-left map zoom: + / level / − on a translucent pill, like the app's rails."""
 
     zoom_step_requested = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("mapZoomControl")
-        self.setStyleSheet("QWidget#mapZoomControl { background: transparent; border: none; }")
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(_MAP_ZOOM_BTN_GAP)
-        btn_font = QFont()
-        btn_font.setPointSize(16)
-        btn_font.setWeight(QFont.Weight.Black)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         side = _MAP_ZOOM_BTN_SIDE
-        self._btn_plus = QPushButton("+")
+        pad = _MAP_ZOOM_PAD
+        self.setStyleSheet(
+            "QWidget#mapZoomControl {"
+            f" background-color: {ui_theme.OVERLAY_RAIL}; border: 1px solid rgba(255, 255, 255, 26);"
+            f" border-radius: {(side + 2 * pad) // 2}px;"
+            "}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(pad, pad, pad, pad)
+        lay.setSpacing(_MAP_ZOOM_BTN_GAP)
+        self._btn_plus = QPushButton()
         self._btn_plus.setObjectName("mapZoomPlusBtn")
-        self._btn_plus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_plus.setToolTip("Zoom in")
+        ui_theme.style_round_button(self._btn_plus, icon_name="plus", size=side, tone="plain")
         self._btn_plus.clicked.connect(lambda: self.zoom_step_requested.emit(1))
-        self._btn_minus = QPushButton("-")
+        self._btn_minus = QPushButton()
         self._btn_minus.setObjectName("mapZoomMinusBtn")
-        self._btn_minus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_minus.setToolTip("Zoom out")
+        ui_theme.style_round_button(self._btn_minus, icon_name="minus", size=side, tone="plain")
         self._btn_minus.clicked.connect(lambda: self.zoom_step_requested.emit(-1))
         self._level = QLabel(format_map_zoom_level_display(16.0))
         self._level.setObjectName("mapZoomLevelLabel")
         self._level.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._level.setFixedSize(side, side)
+        self._level.setFixedSize(side, 22)
         self._level.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._level.setStyleSheet(_MAP_ZOOM_BTN_QSS)
-        for btn in (self._btn_plus, self._btn_minus):
-            btn.setFont(btn_font)
-            btn.setFixedSize(side, side)
-            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            btn.setStyleSheet(_MAP_ZOOM_BTN_QSS)
+        self._level.setStyleSheet(_MAP_ZOOM_LEVEL_QSS)
         lay.addWidget(self._btn_plus, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(self._level, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(self._btn_minus, 0, Qt.AlignmentFlag.AlignHCenter)
-        panel_h = side * 3 + _MAP_ZOOM_BTN_GAP * 2
-        self.setFixedSize(side, panel_h)
+        panel_h = side * 2 + 22 + _MAP_ZOOM_BTN_GAP * 2 + 2 * pad
+        self.setFixedSize(side + 2 * pad, panel_h)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.set_zoom_level(16.0)
 

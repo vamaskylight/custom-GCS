@@ -4,26 +4,24 @@ from __future__ import annotations
 
 import json
 
-from PySide6.QtCore import QPoint, QSettings, QTimer, Qt
+from PySide6.QtCore import QPoint, QRect, QSettings, QTimer, Qt
+from PySide6.QtGui import QRegion
 from PySide6.QtWidgets import QApplication
 
+from vgcs.app import ui_theme
 from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.cam_rail_widgets import CamRailShowHandle
 from vgcs.map.surface.constants import (
-    _CAM_RAIL_GIMBAL_GRID_GAP,
-    _CAM_RAIL_LAYER_INSET,
-    _CAM_RAIL_PAD_BTN_W,
     _MAP_ACTION_RAIL_HEIGHT_PX,
     _MAP_ACTION_RAIL_LEFT_PX,
     _MAP_ACTION_RAIL_TOP_PX,
     _MAP_HUD_MARGIN_PX,
     _MAP_HUD_TOP_PX,
-    _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX,
     _NATIVE_CAM_RAIL_TOP_PX,
     _OBSTACLE_PANEL_MAX_H_PX,
     _OBSTACLE_PANEL_TOP_PX,
 )
-from vgcs.map.surface.settings_keys import _KEY_CAMERA_RAIL_VISIBLE
+from vgcs.map.surface.settings_keys import _KEY_CAMERA_RAIL_VISIBLE, _KEY_OBSERVE_PANEL_OPEN
 
 
 class NativeHudLayoutMixin:
@@ -235,6 +233,156 @@ class NativeHudLayoutMixin:
         except Exception:
             pass
 
+    def _place_map_zoom_ctrl(self, w: int, h: int, po: QPoint, *, plan_on: bool, preview_maps: bool, swapped: bool) -> None:
+        """The map's + / level / − at the bottom left, on a free place.
+
+        Until the 2026-11-09 restyle it stood above the camera picture, and there it sat on the
+        PROXIMITY card's last line, and in Plan Flight on the tool column's Center button. Now it
+        tries, in order: beside the camera picture, the bottom-left corner, beside the PROXIMITY
+        card, beside Plan Flight's tool column and beside its file panel, and takes the first place
+        that covers none of them. In the camera's full view the small map in the corner has its own
+        + and -, so the map's own buttons are hidden there.
+        """
+        mz_ctrl = getattr(self, "_native_map_zoom_ctrl", None)
+        if mz_ctrl is None:
+            return
+        try:
+            self._sync_native_map_zoom_label()
+        except Exception:
+            pass
+        if not bool(getattr(self, "_web_ready", False)) or (preview_maps and swapped):
+            mz_ctrl.hide()
+            return
+        cw = int(mz_ctrl.width()) if mz_ctrl.width() > 0 else 42
+        ch = int(mz_ctrl.height()) if mz_ctrl.height() > 0 else 106
+        gap = 10
+        bottom = max(0, h - gap - ch)
+
+        def on_panel(widget) -> QRect | None:
+            if widget is None or not widget.isVisible():
+                return None
+            return QRect(widget.mapTo(self._panel, QPoint(0, 0)), widget.size())
+
+        # What it must not cover, in the map panel's coordinates.
+        taken: list[QRect] = []
+        pip_rect: QRect | None = None
+        if preview_maps and not swapped:
+            px, py, pw, ph = self._mini_video_pip_rect(w, h)
+            pip_rect = QRect(po.x() + int(px), po.y() + int(py), int(pw), int(ph))
+            taken.append(pip_rect)
+        card = None if plan_on else on_panel(getattr(self, "_obstacle_radar", None))
+        if card is not None:
+            taken.append(card)
+        for name in ("_map_action_rail", "_native_telemetry", "_native_compass"):
+            r = on_panel(getattr(self, name, None))
+            if r is not None:
+                taken.append(r)
+        plan_tools = plan_files = None
+        if plan_on:
+            panel = getattr(self, "_plan_flight_panel", None)
+            if panel is not None:
+                from PySide6.QtWidgets import QFrame
+
+                plan_tools = on_panel(panel.findChild(QFrame, "planFlightToolRail"))
+                plan_files = on_panel(panel.findChild(QFrame, "planCenterPanel"))
+                taken.extend(r for r in (plan_tools, plan_files) if r is not None)
+
+        candidates: list[tuple[int, int]] = []
+        if pip_rect is not None:
+            candidates.append((pip_rect.right() + 1 + gap - po.x(), pip_rect.bottom() + 1 - ch - po.y()))
+        candidates.append((gap, bottom))
+        for r in (card, plan_tools, plan_files):
+            if r is not None:
+                candidates.append((r.right() + 1 + gap - po.x(), bottom))
+        canvas = QRect(0, 0, int(w), int(h))
+        spot = candidates[0] if pip_rect is not None else (gap, bottom)
+        for x, y in candidates:
+            here = QRect(int(x), int(y), cw, ch)
+            if not canvas.contains(here):
+                continue
+            on_screen = here.translated(po)
+            if any(on_screen.intersects(r.adjusted(-4, -4, 4, 4)) for r in taken):
+                continue
+            spot = (int(x), int(y))
+            break
+        mz_ctrl.setGeometry(po.x() + spot[0], po.y() + spot[1], cw, ch)
+        mz_ctrl.show()
+
+    def _observe_panel_open_pref(self) -> bool:
+        raw = QSettings(QS_ORG, QS_APP).value(_KEY_OBSERVE_PANEL_OPEN, False)
+        return raw in (True, "true", "True", "1", 1)
+
+    def _set_observe_panel_open(self, on: bool) -> None:
+        """The Observe panel beside the camera bar, opened and closed by the bar's Observe button.
+
+        It stays as the operator left it, also after a restart. Target, the laser switch and the rest
+        keep working while it is closed: closing it only takes the buttons off the screen.
+        """
+        on = bool(on)
+        btn = getattr(self, "_btn_native_observe", None)
+        if btn is not None and btn.isChecked() != on:
+            btn.blockSignals(True)
+            btn.setChecked(on)
+            btn.blockSignals(False)
+        panel = getattr(self, "_native_observe_panel", None)
+        if panel is not None:
+            panel.setVisible(on)
+        QSettings(QS_ORG, QS_APP).setValue(_KEY_OBSERVE_PANEL_OPEN, on)
+        QTimer.singleShot(0, self._layout_native_hud)
+
+    def _layout_camera_panels(self, w: int, h: int) -> None:
+        """The camera bar at the map's right edge, the gimbal pad left of it, the Observe panel under the pad.
+
+        The panels are children of one transparent layer. The layer's mask is the panels, so a click
+        between them reaches the map. Each panel takes its size from its own layout.
+        """
+        layer = getattr(self, "_native_rail_layer", None)
+        bar = getattr(self, "_native_hud_right", None)
+        if layer is None or bar is None:
+            return
+        pad = getattr(self, "_native_gimbal_panel", None)
+        obs = getattr(self, "_native_observe_panel", None)
+        gap = int(ui_theme.CAMERA_PANEL_GAP)
+
+        def size_of(widget) -> tuple[int, int]:
+            if widget is None or widget.isHidden():
+                return 0, 0
+            lay = widget.layout()
+            if lay is not None:
+                # Qt keeps old sizes while a panel is hidden; a button shown or hidden since then counts now.
+                lay.invalidate()
+                lay.activate()
+            hint = widget.sizeHint()
+            # A panel of fixed width (the Observe panel) is as wide as that, whatever its layout asks.
+            return (
+                max(1, int(hint.width()), int(widget.minimumWidth())),
+                max(1, int(hint.height()), int(widget.minimumHeight())),
+            )
+
+        bar_w, bar_h = size_of(bar)
+        pad_w, pad_h = size_of(pad)
+        obs_w, obs_h = size_of(obs)
+        side_w = max(pad_w, obs_w)
+        side_h = pad_h + (gap + obs_h if obs_h and pad_h else obs_h)
+        layer_w = bar_w + (gap + side_w if side_w else 0)
+        layer_h = max(bar_h, side_h, 1)
+        top = int(_NATIVE_CAM_RAIL_TOP_PX)
+        bottom_margin = 12
+        if top + layer_h > h - bottom_margin:
+            top = max(0, h - bottom_margin - layer_h)
+        x = max(0, w - 10 - layer_w)
+        pt = self._map_canvas.mapTo(self._panel, QPoint(x, top))
+        layer.setGeometry(pt.x(), pt.y(), layer_w, layer_h)
+        bar.setGeometry(layer_w - bar_w, 0, bar_w, bar_h)
+        region = QRegion(bar.geometry())
+        if pad is not None and pad_w:
+            pad.setGeometry(layer_w - bar_w - gap - pad_w, 0, pad_w, pad_h)
+            region = region.united(QRegion(pad.geometry()))
+        if obs is not None and obs_w:
+            obs.setGeometry(layer_w - bar_w - gap - obs_w, (pad_h + gap) if pad_h else 0, obs_w, obs_h)
+            region = region.united(QRegion(obs.geometry()))
+        layer.setMask(region)
+
     def _position_camera_rail_show_tab(self) -> None:
         tab = getattr(self, "_btn_camera_rail_show", None)
         if tab is None or not tab.isVisible():
@@ -301,44 +449,7 @@ class NativeHudLayoutMixin:
             except Exception:
                 w = max(1, self._map_canvas.width())
             h = max(1, self._map_canvas.height())
-            rail = self._native_hud_right
-            ly = getattr(self, "_native_rail_layer", None)
-            panel_y = int(_NATIVE_CAM_RAIL_TOP_PX)
-            bottom_margin = 12
-            available_h = max(120, h - panel_y - bottom_margin)
-            rail.setMinimumWidth(_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX)
-            rl = rail.layout()
-            if rl is not None:
-                rl.activate()
-            rail.updateGeometry()
-            gimbal_pad_w = (
-                58
-                + 8
-                + 3 * _CAM_RAIL_PAD_BTN_W
-                + 2 * _CAM_RAIL_GIMBAL_GRID_GAP
-                + 8  # pad border / grid padding
-            )
-            rail_margins_h = 8 + 16
-            content_w = max(
-                _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX,
-                int(rail.sizeHint().width()),
-                int(rail.minimumSizeHint().width()),
-                gimbal_pad_w + rail_margins_h,
-            )
-            inl, intop, inr, inb = _CAM_RAIL_LAYER_INSET
-            panel_w = content_w + inl + inr
-            panel_x = max(0, w - panel_w - 18)  # git `#cameraRail { right: 18px }`
-            rail.setFixedWidth(content_w)
-            need_h = max(120, int(rail.sizeHint().height()))
-            # Never shrink below content height (that clips LENS / gimbal buttons). Shift up instead.
-            content_h = need_h
-            panel_h = content_h + intop + inb
-            if panel_y + panel_h > h - bottom_margin:
-                panel_y = max(0, h - bottom_margin - panel_h)
-            if ly is not None:
-                pt = self._map_canvas.mapTo(self._panel, QPoint(panel_x, panel_y))
-                ly.setGeometry(pt.x(), pt.y(), panel_w, panel_h)
-            rail.setGeometry(inl, intop, content_w, content_h)
+            self._layout_camera_panels(w, h)
             self._position_camera_rail_show_tab()
             # Git `#mapFooterHud { right: 10px; bottom: 2px }` — compass stays bottom-right of the
             # map even when `#cameraRail` is shown after MAVLink connect (rail is top-right; z-order
@@ -385,24 +496,6 @@ class NativeHudLayoutMixin:
             # The PiP is bottom-left, clear of the plan panel's columns, and the
             # operator asked for the camera feed while planning.
             preview_maps = preview_on
-            mz_ctrl = getattr(self, "_native_map_zoom_ctrl", None)
-            if mz_ctrl is not None:
-                try:
-                    self._sync_native_map_zoom_label()
-                except Exception:
-                    pass
-                ctrl_w = int(mz_ctrl.width()) if mz_ctrl.width() > 0 else 32
-                ctrl_h = int(mz_ctrl.height()) if mz_ctrl.height() > 0 else 104
-                ctrl_x = 10
-                ctrl_y = max(0, h - 2 - ctrl_h)
-                if preview_maps and not swapped:
-                    _px, pip_y, _pw, pip_h = self._mini_video_pip_rect(w, h)
-                    ctrl_y = min(ctrl_y, max(8, int(pip_y) - ctrl_h - 8))
-                mz_ctrl.setGeometry(po.x() + ctrl_x, po.y() + ctrl_y, ctrl_w, ctrl_h)
-                if not bool(getattr(self, "_web_ready", False)):
-                    mz_ctrl.hide()
-                else:
-                    mz_ctrl.show()
             _pip_x, _pip_y, _pip_w, pip_h = self._mini_video_pip_rect(w, h)
             margin = _MAP_HUD_MARGIN_PX
             # M9 obstacle radar — compact card top-left; mini-video is a small fixed PiP bottom-left.
@@ -432,6 +525,8 @@ class NativeHudLayoutMixin:
                     obr.show()
             elif obr is not None:
                 obr.hide()
+            # After the PROXIMITY card, whose place it must keep clear of.
+            self._place_map_zoom_ctrl(w, h, po, plan_on=plan_on, preview_maps=preview_maps, swapped=swapped)
             # PiP mode: show video only (no second minimap card — main map is the overview).
             # Fullscreen camera swap: minimap takes the **same PiP slot as the video** (bottom-left)
             # so the swap is symmetric — clicking the corner card swaps back.

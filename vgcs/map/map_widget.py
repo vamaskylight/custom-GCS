@@ -16,7 +16,6 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from PySide6.QtCore import (
-    QByteArray,
     QBuffer,
     QObject,
     QPoint,
@@ -47,26 +46,21 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QSizePolicy,
 )
 from PySide6.QtGui import (
-    QBrush,
     QDesktopServices,
-    QFont,
-    QIcon,
     QImage,
     QKeySequence,
-    QPainter,
     QPainterPath,
     QPen,
-    QPixmap,
     QPolygonF,
-    QColor,
-    QRadialGradient,
     QShortcut,
 )
+from vgcs.app import ui_theme
 from vgcs.map.native_video_overlay import (
     NativeVideoOverlayLayer,
     VideoOverlayFacadeHint,
@@ -190,7 +184,6 @@ from vgcs.map.map_footer_hud import (
     MapFooterCompass,
     MapFooterTelemetryStrip,
     MapZoomControlPanel,
-    TelemetryStripIcon,
 )
 from vgcs.map.sensor_obstacle_widget import ObstacleRadarPanel
 from vgcs.map.map_3d_marker_overlay import Map3dLayer, Map3dMarkerOverlay
@@ -198,90 +191,15 @@ from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_u
 from vgcs.map.cam_rail_widgets import (
     CamM13TrackBlock,
     CamObserveBlock,
-    CamRailGimbalPad,
     CamRailShowHandle,
-    CamRecordTimerRow,
 )
 from vgcs.map.plan_flight_panel import PlanFlightPanel
 from vgcs.map.surface.constants import (
-    _CAM_RAIL_GIMBAL_GRID_GAP,
-    _CAM_RAIL_LAYER_INSET,
-    _CAM_RAIL_LAYOUT_SPACING,
-    _CAM_RAIL_LENS_BTN_H,
-    _CAM_RAIL_LENS_ROW_H,
-    _CAM_RAIL_PAD_BTN_H,
-    _CAM_RAIL_PAD_BTN_W,
-    _MAP_HUD_GLASS_BG,
-    _MAP_HUD_GLASS_BORDER,
     _MINI_VIDEO_PIP_H_PX,
     _MINI_VIDEO_PIP_W_PX,
-    _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX,
-    _NATIVE_CAM_RAIL_MIN_WIDTH_PX,
     _NATIVE_CAM_RAIL_TOP_PX,
     MAP_BACKEND_BUILD,
 )
-
-try:
-    from PySide6.QtSvg import QSvgRenderer
-except Exception:  # optional component on some Qt builds
-    QSvgRenderer = None  # type: ignore[misc, assignment]
-
-# Git `e48c1a7` `#cameraTopRow` SVG icons (`camIcon` classes).
-_GIT_CAM_VIDEO_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-    '<rect x="3" y="7" width="12" height="10" rx="2" fill="#e8edf8"/>'
-    '<polygon points="16,10 21,8 21,16 16,14" fill="#e8edf8"/>'
-    "</svg>"
-)
-_GIT_CAM_PHOTO_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-    '<path d="M8 6h8l1.2 2H20a2 2 0 0 1 2 2v7a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3v-7a2 2 0 0 1 2-2h2.8L8 6z" fill="#e8edf8"/>'
-    '<circle cx="12" cy="13.5" r="3.2" fill="rgba(39,47,61,242)"/>'
-    "</svg>"
-)
-# git `25970f0` `#camSplitBtn` (4-up) / `#camFollowBtn` — match `camIcon` stroke/fill.
-_GIT_CAM_SPLIT_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-    '<rect x="3" y="3" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
-    '<rect x="13" y="3" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
-    '<rect x="3" y="13" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
-    '<rect x="13" y="13" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
-    "</svg>"
-)
-_GIT_CAM_FOLLOW_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-    '<circle cx="12" cy="12" r="6.5" fill="none" stroke="#e8edf8" stroke-width="1.75"/>'
-    '<path d="M12 4.5v3.2M12 16.3v3.2M4.5 12h3.2M16.3 12h3.2" stroke="#e8edf8" stroke-width="2" stroke-linecap="round"/>'
-    '<circle cx="12" cy="12" r="2.2" fill="#e8edf8"/>'
-    "</svg>"
-)
-# The camera's torch (`#camTorchBtn`, row B27): a hand torch, its light upwards.
-_GIT_CAM_TORCH_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-    '<path d="M7 3h10v3l-2.5 4.5V20a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-9.5L7 6z" fill="#e8edf8"/>'
-    '<rect x="11" y="12.5" width="2" height="3.5" rx="1" fill="rgba(39,47,61,242)"/>'
-    "</svg>"
-)
-
-
-def _git_cam_icon_from_svg(svg_xml: str, logical_px: int = 22) -> QIcon:
-    """Rasterize embedded SVG for toolbar-sized icons (falls back to empty QIcon if Svg unavailable)."""
-    if QSvgRenderer is None:
-        return QIcon()
-    r = QSvgRenderer(QByteArray(svg_xml.encode("utf-8")))
-    if not r.isValid():
-        return QIcon()
-    d = max(16, int(logical_px))
-    pm = QPixmap(d, d)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    r.render(p)
-    p.end()
-    return QIcon(pm)
-
-
-# Map action rail: icon size (logical px) — same line-art style as ``TelemetryStripIcon`` (footer HUD).
-_MAP_ACTION_ICON_LOGICAL_PX = 26
 
 # QSettings: Plan Flight Save vs map toolbar export use different "last file" keys.
 _QS_NS = "VGCS"
@@ -317,489 +235,9 @@ def _save_qimage_to_path(img: QImage, path: Path) -> bool:
     return save_qimage_to_path(img, path)
 
 
-def _native_cam_record_dot_pixmap(size: int = 14) -> QPixmap:
-    """Inner red dot raster for `#camRecordBtn` (`size` px, matches button scale)."""
-    pm = QPixmap(size, size)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    rg = QRadialGradient(float(size) * 0.5, float(size) * 0.35, float(size) * 0.48)
-    rg.setColorAt(0.0, QColor("#ff4b4b"))
-    rg.setColorAt(1.0, QColor("#f62d2d"))
-    p.setBrush(QBrush(rg))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.drawEllipse(0, 0, size, size)
-    p.end()
-    return pm
-
-
-# Native HUD glass — same opacity as ``MapFooterTelemetryStrip`` (`map_footer_hud.py`).
-
-# Native `#cameraRail` — label/button text matches `TELEMETRY_STRIP_VALUE_STYLE` in map_footer_hud.py
-# (`color: #dce5f5; font-size: 15px; font-weight: 600`).
-# Inner rail: transparent (glass is on ``#nativeCameraRailLayer``); control chrome below.
-_NATIVE_CAMERA_RAIL_QSS = (
-    "QFrame#nativeCameraRail {\n"
-    "  background: transparent;\n"
-    "  border: none;\n"
-    f"  min-width: {_NATIVE_CAM_RAIL_MIN_WIDTH_PX}px;\n"
-    '  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;\n'
-    "  color: #dce5f5;\n"
-    "  font-size: 15px;\n"
-    "  font-weight: 600;\n"
-    "}\n"
-    "#cameraTopRow {\n"
-    "  background: transparent;\n"
-    "  border: none;\n"
-    "}\n"
-) + """
-QPushButton#camVideoBtn {
-  width: 28px;
-  height: 28px;
-  max-width: 28px;
-  max-height: 28px;
-  min-width: 28px;
-  min-height: 28px;
-  border-radius: 14px;
-  padding: 0px;
-  margin: 0px;
-  margin-right: 2px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: #dce5f5;
-  font-size: 15px;
-  font-weight: 600;
-}
-QPushButton#camVideoBtn:hover {
-  background: rgba(110, 123, 148, 51);
-}
-QPushButton#camVideoBtn:checked {
-  border: 1px solid rgba(214, 224, 241, 230);
-  background: rgba(27, 33, 45, 245);
-}
-QPushButton#camPhotoBtn {
-  width: 28px;
-  height: 28px;
-  min-width: 28px;
-  max-width: 28px;
-  min-height: 28px;
-  max-height: 28px;
-  border-radius: 14px;
-  padding: 0px;
-  margin: 0px;
-  margin-right: 2px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: #dce5f5;
-  font-size: 15px;
-  font-weight: 600;
-}
-QPushButton#camPhotoBtn:hover {
-  background: rgba(110, 123, 148, 51);
-}
-QPushButton#camPhotoBtn:checked {
-  border: 1px solid rgba(214, 224, 241, 230);
-  background: rgba(27, 33, 45, 245);
-}
-QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn, QPushButton#camPaletteBtn,
-QPushButton#camTorchBtn {
-  width: 28px;
-  height: 28px;
-  min-width: 28px;
-  max-width: 28px;
-  min-height: 28px;
-  max-height: 28px;
-  padding: 0px;
-  margin: 0px;
-  border-radius: 7px;
-  border: 1px solid rgba(196, 209, 230, 55);
-  background-color: rgba(22, 27, 38, 235);
-  color: #e8edf8;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 11px;
-  font-weight: 700;
-}
-QPushButton#camSplitBtn:hover, QPushButton#camFollowBtn:hover, QPushButton#camThermalBtn:hover,
-QPushButton#camPaletteBtn:hover, QPushButton#camTorchBtn:hover {
-  background-color: rgba(40, 48, 62, 245);
-  border-color: rgba(229, 237, 251, 85);
-}
-QPushButton#camTorchBtn:checked {
-  border: 1px solid rgba(255, 214, 92, 230);
-  background-color: rgba(70, 58, 18, 250);
-}
-QPushButton#camSplitBtn:checked, QPushButton#camFollowBtn:checked, QPushButton#camThermalBtn:checked {
-  border: 1px solid rgba(105, 232, 111, 220);
-  background-color: rgba(24, 52, 34, 250);
-  color: #c8ffc8;
-}
-QPushButton#camThermalBtn:disabled, QPushButton#camPaletteBtn:disabled {
-  opacity: 0.45;
-}
-/* Split is logically on but main canvas is a single zoomed channel (not the 2×2 composite): neutral chrome. */
-QPushButton#camSplitBtn:checked[splitHidden="true"] {
-  border: 1px solid rgba(196, 209, 230, 55);
-  background-color: rgba(22, 27, 38, 235);
-  color: #e8edf8;
-}
-QLabel#camMagnificationLabel {
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 14px;
-  font-weight: 600;
-  padding: 4px 8px;
-  margin-left: 2px;
-  border-radius: 6px;
-  border: 1px solid rgba(80, 92, 118, 107);
-  background: rgba(26, 33, 45, 215);
-  min-width: 44px;
-}
-QPushButton#camRailHideBtn {
-  width: 28px;
-  height: 28px;
-  min-width: 28px;
-  max-width: 28px;
-  min-height: 28px;
-  max-height: 28px;
-  padding: 0px;
-  margin: 0px;
-  border-radius: 7px;
-  border: 1px solid rgba(196, 209, 230, 55);
-  background-color: rgba(22, 27, 38, 235);
-  color: #e8edf8;
-  font-size: 18px;
-  font-weight: 600;
-}
-QPushButton#camRailHideBtn:hover {
-  background-color: rgba(40, 48, 62, 245);
-  border-color: rgba(229, 237, 251, 85);
-  color: #ffffff;
-}
-QPushButton#camRecordBtn {
-  width: 34px;
-  height: 34px;
-  min-width: 34px;
-  max-width: 34px;
-  min-height: 34px;
-  max-height: 34px;
-  padding: 0px;
-  border-radius: 17px;
-  border: 1px solid rgba(231, 239, 255, 180);
-  background: qradialgradient(cx:0.5, cy:0.35, radius:0.7, fx:0.5, fy:0.35,
-    stop:0 rgba(35, 43, 57, 250), stop:1 rgba(20, 26, 36, 250));
-}
-QPushButton#camRecordBtn:checked {
-  border: 1px solid rgba(255, 130, 130, 220);
-}
-QLabel#camTimer {
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-  color: #dce5f5;
-  background: rgba(255, 65, 65, 220);
-  border-radius: 6px;
-  padding: 3px 10px;
-  min-width: 82px;
-  border: none;
-}
-QLabel#camSectionHeader {
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  padding: 0px 1px 2px 1px;
-  margin-top: 0px;
-  border: none;
-  background: transparent;
-  min-height: 18px;
-}
-QLabel#camSectionHeaderInline {
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  padding: 0px 4px 0px 0px;
-  border: none;
-  background: transparent;
-  min-width: 58px;
-  max-width: 58px;
-}
-QLabel#camAxisLabel {
-  color: #c8d3ea;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-  padding: 0px;
-  margin: 0px;
-  border: none;
-  background: transparent;
-  min-width: 16px;
-  max-width: 16px;
-}
-QLabel#camSectionHeaderLens {
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  padding: 0px 2px 0px 0px;
-  border: none;
-  background: transparent;
-  min-width: 42px;
-  max-width: 42px;
-}
-QPushButton[camLensPadBtn=true] {
-  min-width: 34px;
-  max-width: 34px;
-  min-height: 34px;
-  max-height: 34px;
-  border-radius: 6px;
-  border: 1px solid rgba(196, 209, 230, 38);
-  background: rgba(18, 22, 32, 75);
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-  padding: 0px;
-}
-QPushButton[camLensPadBtn=true]:hover {
-  background: rgba(110, 123, 148, 45);
-  border-color: rgba(229, 237, 251, 70);
-}
-QWidget#camLensRow {
-  background: transparent;
-  min-height: 40px;
-  max-height: 40px;
-}
-QWidget#camLensControls, QWidget#camInlineRowBody {
-  background: transparent;
-}
-QFrame#camRecordArch {
-  margin-top: 0px;
-  border: none;
-  background: transparent;
-}
-QFrame#camRailSep {
-  background: rgba(188, 202, 224, 45);
-  max-height: 1px;
-  min-height: 1px;
-  border: none;
-  margin-top: 3px;
-  margin-bottom: 3px;
-}
-QPushButton#observeTarget, QPushButton#observeClip,
-QPushButton#observeReport, QPushButton#observeReset {
-  min-height: 34px;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-  border-radius: 6px;
-  border: 1px solid rgba(196, 209, 230, 38);
-  background: rgba(18, 22, 32, 75);
-  color: #dce5f5;
-  padding: 2px 6px;
-}
-QPushButton#observeTarget:hover, QPushButton#observeClip:hover,
-QPushButton#observeReport:hover, QPushButton#observeReset:hover {
-  background: rgba(110, 123, 148, 45);
-  border-color: rgba(229, 237, 251, 70);
-}
-QPushButton#observeTarget:checked, QPushButton#observeClip:checked {
-  border-color: rgba(214, 224, 241, 230);
-  background: rgba(27, 33, 45, 245);
-}
-QPushButton#observeDooafSetup {
-  min-height: 34px;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 14px;
-  font-weight: 600;
-  border-radius: 6px;
-  border: 1px solid rgba(120, 168, 230, 90);
-  background: rgba(36, 58, 92, 210);
-  color: #e8f0ff;
-  padding: 2px 6px;
-}
-QPushButton#observeDooafSetup:hover {
-  background: rgba(52, 82, 128, 235);
-  border-color: rgba(180, 210, 255, 120);
-}
-QPushButton#observeLaser {
-  min-height: 34px;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 14px;
-  font-weight: 600;
-  border-radius: 6px;
-  border: 1px solid rgba(196, 209, 230, 38);
-  background: rgba(18, 22, 32, 75);
-  color: #dce5f5;
-  padding: 2px 6px;
-}
-QPushButton#observeLaser:hover {
-  background: rgba(110, 123, 148, 45);
-  border-color: rgba(229, 237, 251, 70);
-}
-QPushButton#observeLaser:checked {
-  border-color: rgba(255, 196, 92, 230);
-  background: rgba(92, 64, 18, 235);
-  color: #ffe2a8;
-}
-QLabel#observeDooafHint {
-  color: #8fa4c4;
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.25;
-}
-QPushButton#observeClip[recording="true"] {
-  background: rgba(200, 45, 45, 240);
-  border-color: rgba(255, 130, 130, 220);
-  color: #ffffff;
-  font-weight: 700;
-}
-QPushButton[camPadBtn=true] {
-  min-width: 42px;
-  max-width: 42px;
-  min-height: 34px;
-  max-height: 34px;
-  border-radius: 6px;
-  border: 1px solid rgba(196, 209, 230, 38);
-  background: rgba(18, 22, 32, 75);
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 14px;
-  font-weight: 600;
-  padding: 0px;
-}
-QPushButton[camPadBtn=true]:hover {
-  background: rgba(110, 123, 148, 45);
-  border-color: rgba(229, 237, 251, 70);
-}
-QPushButton[camPadBtn=true]:checked {
-  border-color: rgba(214, 224, 241, 230);
-  background: rgba(27, 33, 45, 245);
-}
-"""
-
-
-
-
-def _cam_rail_sep() -> QFrame:
-    """Divider between git `#cameraRail` core (video…settings) and MAVLink pad extras."""
-    f = QFrame()
-    f.setObjectName("camRailSep")
-    f.setFixedHeight(1)
-    return f
-
-
-def _cam_rail_gimbal_row(label: str, pad: QWidget) -> QWidget:
-    """Gimbal pad needs explicit width; keep inset from the glass panel's right edge."""
-    w = QWidget()
-    w.setObjectName("camInlineRow")
-    w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-    h = QHBoxLayout(w)
-    h.setContentsMargins(0, 2, 2, 2)
-    h.setSpacing(8)
-    lab = QLabel(label)
-    lab.setObjectName("camSectionHeaderInline")
-    lab.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-    pad.setObjectName("camInlineRowBody")
-    pad.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-    h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
-    h.addWidget(pad, 0, Qt.AlignmentFlag.AlignVCenter)
-    h.addStretch(1)
-    return w
-
-
-def _cam_rail_inline_row(
-    label: str,
-    body: QWidget,
-    *,
-    align_body_right: bool = False,
-) -> QWidget:
-    """Compact row: section label + controls (one line, no extra header row)."""
-    w = QWidget()
-    w.setObjectName("camInlineRow")
-    w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-    h = QHBoxLayout(w)
-    h.setContentsMargins(0, 2, 2 if align_body_right else 0, 2)
-    h.setSpacing(8)
-    lab = QLabel(label)
-    lab.setObjectName("camSectionHeaderInline")
-    lab.setAlignment(
-        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-    )
-    body.setObjectName("camInlineRowBody")
-    if align_body_right:
-        body.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
-        h.addStretch(1)
-        h.addWidget(body, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-    else:
-        body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
-        h.addWidget(body, 1, Qt.AlignmentFlag.AlignVCenter)
-    return w
-
-
-def _cam_lens_pad_btn(btn: QPushButton) -> QPushButton:
-    """Lens −/+ only — QSS min/max must match fixed size or Qt overlaps widgets."""
-    btn.setProperty("camLensPadBtn", True)
-    btn.setFixedSize(34, _CAM_RAIL_LENS_BTN_H)
-    btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-    return btn
-
-
-def _cam_rail_lens_row(
-    zoom_minus: QPushButton,
-    zoom_plus: QPushButton,
-    focus_minus: QPushButton,
-    focus_plus: QPushButton,
-) -> QWidget:
-    """Single flat row: LENS · Z − + · F − + (fixed height so buttons are not vertically clipped)."""
-    row = QWidget()
-    row.setObjectName("camLensRow")
-    row.setFixedHeight(_CAM_RAIL_LENS_ROW_H)
-    row.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-    lay = QHBoxLayout(row)
-    lay.setContentsMargins(0, 4, 0, 4)
-    lay.setSpacing(8)
-    lab = QLabel("LENS")
-    lab.setObjectName("camSectionHeaderLens")
-    lab.setFixedWidth(42)
-    lab.setAlignment(
-        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-    )
-    lay.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
-
-    def _add_axis(cap: str, minus_btn: QPushButton, plus_btn: QPushButton) -> None:
-        cap_lbl = QLabel(cap)
-        cap_lbl.setObjectName("camAxisLabel")
-        cap_lbl.setFixedWidth(16)
-        cap_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _cam_lens_pad_btn(minus_btn)
-        _cam_lens_pad_btn(plus_btn)
-        lay.addWidget(cap_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(minus_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(plus_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-
-    _add_axis("Z", zoom_minus, zoom_plus)
-    lay.addSpacing(6)
-    _add_axis("F", focus_minus, focus_plus)
-    lay.addStretch(1)
-    return row
-
-
-def _cam_pad_btn(
-    btn: QPushButton,
-    *,
-    width: int = _CAM_RAIL_PAD_BTN_W,
-    height: int = _CAM_RAIL_PAD_BTN_H,
-) -> QPushButton:
-    btn.setProperty("camPadBtn", True)
-    btn.setFixedSize(int(width), int(height))
-    btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-    return btn
+# The camera panels' sheet (vgcs/app/ui_theme.py, the 2026-11-09 restyle). One sheet on the panels'
+# layer styles the bar, the gimbal pad, the Observe panel and the text buttons in them.
+_NATIVE_CAMERA_RAIL_QSS = ui_theme.camera_panels_qss()
 
 
 from vgcs.map.observation import MapObservationMixins
@@ -1058,8 +496,8 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._native_video_preview.setStyleSheet(
             "QLabel#nativeVideoPreview {"
             "background: #000;"
-            "border: 1px solid rgba(206, 220, 242, 0.35);"
-            "border-radius: 8px;"
+            "border: 1px solid rgba(255, 255, 255, 110);"
+            "border-radius: 10px;"
             "}"
         )
         self._native_video_preview.hide()
@@ -1084,209 +522,117 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             "bottom": 130,
         }
         self._native_video_preview.mousePressEvent = self._on_native_video_click  # type: ignore[assignment]
-        # Rail is a **sibling** of `_map_canvas` under the map panel (not a child of `_map_canvas`).
-        # PiP `QLabel` + tile map live inside `_map_canvas`; keeping the rail on the same surface made
-        # `setPixmap`/stacking reorder the PiP above the rail on some platforms (photo / rail unclickable).
-        # Opaque `QFrame` host: on Windows a bare `QWidget` can be hit-transparent; clicks fall through to the map.
+        # The camera panels, like the app's (2026-11-09 restyle): a slim camera bar on the right edge
+        # (video or photo, the shutter, the camera's own switches, Track and Follow, Observe), a pad for
+        # the gimbal and the lens beside it, and the Observe panel (Target, Clip, Report, Reset, Set TGT
+        # and Set HIT, the laser switch, DOOAF Setup), which opens from the bar and stays open until it
+        # is closed. Until then all of it was one wide box of small text buttons. Every button keeps its
+        # name, its signals and its hold logic; only where it sits and how it looks changed.
+        #
+        # The panels are children of one transparent layer, a **sibling** of `_map_canvas` under the
+        # map panel (not a child of `_map_canvas`): PiP `QLabel` + tile map live inside `_map_canvas`;
+        # keeping the panels on the same surface made `setPixmap`/stacking reorder the PiP above them on
+        # some platforms (photo / rail unclickable). Hiding the layer hides every panel. Its mask (set in
+        # `_layout_native_hud`) is the panels themselves, so a click between them reaches the map.
         self._native_rail_layer = QFrame(panel)
         self._native_rail_layer.setObjectName("nativeCameraRailLayer")
         self._native_rail_layer.setFrameShape(QFrame.Shape.NoFrame)
         self._native_rail_layer.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        # One continuous glass panel (same as ``MapFooterTelemetryStrip``) — rgba in QSS, not WA_TranslucentBackground.
         self._native_rail_layer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._native_rail_layer.setAutoFillBackground(False)
-        self._native_rail_layer.setStyleSheet(
-            "QFrame#nativeCameraRailLayer {"
-            " background: " + _MAP_HUD_GLASS_BG + ";"
-            " border: 1px solid " + _MAP_HUD_GLASS_BORDER + ";"
-            " border-radius: 14px;"
-            "}"
-        )
+        self._native_rail_layer.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_rail_layer.hide()
-        # Native `#cameraRail`: single `QFrame` — height follows layout (no `QScrollArea` scrollbar).
+        _cam_small = ui_theme.CAMERA_SMALL_BUTTON
+        _cam_btn = ui_theme.CAMERA_BUTTON
+        _cam_m = ui_theme.RAIL_MARGIN
+
+        # --- The camera bar -------------------------------------------------------------------------
         self._native_hud_right = QFrame(self._native_rail_layer)
         self._native_hud_right.setObjectName("nativeCameraRail")
         self._native_hud_right.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._native_hud_right.setAutoFillBackground(False)
-        self._native_hud_right.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
-        self._native_hud_right_layout.setContentsMargins(8, 7, 16, 8)
-        self._native_hud_right_layout.setSpacing(_CAM_RAIL_LAYOUT_SPACING)
+        self._native_hud_right_layout.setContentsMargins(_cam_m, _cam_m + 2, _cam_m, _cam_m + 2)
+        self._native_hud_right_layout.setSpacing(ui_theme.RAIL_SPACING)
 
-        self._camera_top_row = QFrame(self._native_hud_right)
-        self._camera_top_row.setObjectName("cameraTopRow")
-        ctr_layout = QHBoxLayout(self._camera_top_row)
-        ctr_layout.setContentsMargins(3, 3, 3, 3)
-        ctr_layout.setSpacing(4)
-
-        self._btn_native_video = QPushButton()
+        mode_row = QWidget(self._native_hud_right)
+        mode_row.setObjectName("cameraModeRow")
+        mode_lay = QHBoxLayout(mode_row)
+        mode_lay.setContentsMargins(0, 0, 0, 0)
+        mode_lay.setSpacing(6)
+        self._btn_native_video = QPushButton(mode_row)
         self._btn_native_video.setObjectName("camVideoBtn")
         self._btn_native_video.setCheckable(True)
         self._btn_native_video.setChecked(True)
-        self._btn_native_video.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        _ico_main = 20
-        _iv = _git_cam_icon_from_svg(_GIT_CAM_VIDEO_SVG, _ico_main)
-        if _iv.isNull():
-            self._btn_native_video.setText("🎥")
-        else:
-            self._btn_native_video.setIcon(_iv)
-            self._btn_native_video.setIconSize(QSize(_ico_main, _ico_main))
-
-        self._btn_native_photo = QPushButton()
+        self._btn_native_video.setToolTip("Video / live mode — red button records")
+        ui_theme.style_round_button(self._btn_native_video, icon_name="vama_record", size=_cam_small, tone="info")
+        self._btn_native_photo = QPushButton(mode_row)
         self._btn_native_photo.setObjectName("camPhotoBtn")
         self._btn_native_photo.setCheckable(True)
-        self._btn_native_photo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_native_photo.setToolTip("Photo mode — use the red shutter below to capture")
-        self._btn_native_video.setToolTip("Video / live mode — red button records")
-        _ip = _git_cam_icon_from_svg(_GIT_CAM_PHOTO_SVG, _ico_main)
-        if _ip.isNull():
-            self._btn_native_photo.setText("📷")
-        else:
-            self._btn_native_photo.setIcon(_ip)
-            self._btn_native_photo.setIconSize(QSize(_ico_main, _ico_main))
+        ui_theme.style_round_button(self._btn_native_photo, icon_name="vama_photo", size=_cam_small, tone="info")
+        mode_lay.addWidget(self._btn_native_video)
+        mode_lay.addWidget(self._btn_native_photo)
 
-        ctr_layout.addWidget(self._btn_native_video)
-        ctr_layout.addWidget(self._btn_native_photo)
-
-        # git `25970f0` `#cameraTopRow`: Split (4-up) + Follow — same embedded SVGs as legacy `camIcon` row.
-        self._btn_native_split = QPushButton()
-        self._btn_native_split.setObjectName("camSplitBtn")
-        self._btn_native_split.setCheckable(True)
-        self._btn_native_split.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_native_split.setToolTip("Split view (4-up)")
-        self._btn_native_split.setFixedSize(28, 28)
-        self._btn_native_split.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        _is = _git_cam_icon_from_svg(_GIT_CAM_SPLIT_SVG, _ico_main)
-        if _is.isNull():
-            self._btn_native_split.setText("▦")
-        else:
-            self._btn_native_split.setIcon(_is)
-            self._btn_native_split.setIconSize(QSize(_ico_main, _ico_main))
-
-        self._btn_native_follow = QPushButton()
-        self._btn_native_follow.setObjectName("camFollowBtn")
-        self._btn_native_follow.setCheckable(True)
-        self._btn_native_follow.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_native_follow.setToolTip("Follow vehicle (center map)")
-        self._btn_native_follow.setFixedSize(28, 28)
-        self._btn_native_follow.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        _ifw = _git_cam_icon_from_svg(_GIT_CAM_FOLLOW_SVG, _ico_main)
-        if _ifw.isNull():
-            self._btn_native_follow.setText("◎")
-        else:
-            self._btn_native_follow.setIcon(_ifw)
-            self._btn_native_follow.setIconSize(QSize(_ico_main, _ico_main))
-
-        self._btn_native_thermal = QPushButton("IR")
-        self._btn_native_thermal.setObjectName("camThermalBtn")
-        self._btn_native_thermal.setCheckable(True)
-        self._btn_native_thermal.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_native_thermal.setFixedSize(28, 28)
-        self._btn_native_thermal.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self._btn_native_thermal.setToolTip(
-            "Thermal IR camera (C13: one RTSP stream — switches between day and thermal; "
-            "gimbal control unchanged)"
-        )
-        self._btn_native_thermal.setText("IR")
-        self._btn_native_thermal.hide()
-
-        # Thermal colour mode (M12): a strip of the mode in use; a click lists the others.
-        self._btn_native_palette = QPushButton()
-        self._btn_native_palette.setObjectName("camPaletteBtn")
-        self._btn_native_palette.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_native_palette.setFixedSize(28, 28)
-        self._btn_native_palette.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self._btn_native_palette.hide()
-
-        # The camera's torch (row B27): only for a camera with one (_sync_native_torch_button).
-        self._btn_native_torch = QPushButton()
-        self._btn_native_torch.setObjectName("camTorchBtn")
-        self._btn_native_torch.setCheckable(True)
-        self._btn_native_torch.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_native_torch.setFixedSize(28, 28)
-        self._btn_native_torch.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._btn_native_torch.setToolTip("The camera's torch, on or off")
-        _it = _git_cam_icon_from_svg(_GIT_CAM_TORCH_SVG, _ico_main)
-        if _it.isNull():
-            self._btn_native_torch.setText("T")
-        else:
-            self._btn_native_torch.setIcon(_it)
-            self._btn_native_torch.setIconSize(QSize(_ico_main, _ico_main))
-        self._btn_native_torch.hide()
-
-        ctr_layout.addWidget(self._btn_native_split, 0)
-        ctr_layout.addWidget(self._btn_native_thermal, 0)
-        ctr_layout.addWidget(self._btn_native_palette, 0)
-        ctr_layout.addWidget(self._btn_native_torch, 0)
-        ctr_layout.addWidget(self._btn_native_follow, 0)
-        self._lbl_camera_top_zoom = QLabel(_format_video_zoom_label(1.0))
-        self._lbl_camera_top_zoom.setObjectName("camMagnificationLabel")
-        self._lbl_camera_top_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_camera_top_zoom.setToolTip("Camera magnification")
-        ctr_layout.addWidget(self._lbl_camera_top_zoom, 0, Qt.AlignmentFlag.AlignVCenter)
-        ctr_layout.addStretch(1)
-        self._btn_native_rail_hide = QPushButton("›")
-        self._btn_native_rail_hide.setObjectName("camRailHideBtn")
-        self._btn_native_rail_hide.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_native_rail_hide.setFixedSize(28, 28)
-        self._btn_native_rail_hide.setToolTip("Hide camera panel")
-        self._btn_native_rail_hide.clicked.connect(
-            lambda: self._set_camera_rail_panel_visible(False)
-        )
-        ctr_layout.addWidget(self._btn_native_rail_hide, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        self._btn_native_record = QPushButton()
+        # The shutter: records in video mode (red while it records), takes a photo in photo mode.
+        self._btn_native_record = QPushButton(self._native_hud_right)
         self._btn_native_record.setObjectName("camRecordBtn")
         self._btn_native_record.setCheckable(True)
-        self._btn_native_record.setFixedSize(34, 34)
+        ui_theme.style_round_button(self._btn_native_record, size=ui_theme.SHUTTER_SIZE, tone="record")
         self._btn_native_record.setText("")
-        self._btn_native_record.setIcon(QIcon(_native_cam_record_dot_pixmap(14)))
-        self._btn_native_record.setIconSize(QSize(14, 14))
+        self._btn_native_record.setIcon(ui_theme.record_icon(20))
+        self._btn_native_record.setIconSize(QSize(20, 20))
         self._btn_native_record.setToolTip("Record video")
 
-        self._lbl_native_cam_timer = QLabel("00:00:00")
+        self._lbl_native_cam_timer = QLabel("00:00:00", self._native_hud_right)
         self._lbl_native_cam_timer.setObjectName("camTimer")
         self._lbl_native_cam_timer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_native_cam_timer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._lbl_native_cam_timer.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        self._native_hud_right_layout.addWidget(self._camera_top_row)
-        self._native_hud_right_layout.addWidget(
-            CamRecordTimerRow(
-                self._btn_native_record,
-                self._lbl_native_cam_timer,
-                self._native_hud_right,
-            )
+        # The camera's switches, two to a row. A row whose buttons are all hidden takes no room.
+        self._camera_top_row = QFrame(self._native_hud_right)
+        self._camera_top_row.setObjectName("cameraTopRow")
+        ctr_layout = QGridLayout(self._camera_top_row)
+        ctr_layout.setContentsMargins(0, 0, 0, 0)
+        ctr_layout.setHorizontalSpacing(6)
+        ctr_layout.setVerticalSpacing(ui_theme.RAIL_SPACING)
+
+        self._btn_native_split = ui_theme.round_button(
+            self._camera_top_row, object_name="camSplitBtn", icon_name="split", size=_cam_small,
+            tooltip="Split view (4-up)", checkable=True, tone="info",
         )
+        self._btn_native_follow = ui_theme.round_button(
+            self._camera_top_row, object_name="camFollowBtn", icon_name="follow_map", size=_cam_small,
+            tooltip="Follow vehicle (center map)", checkable=True, tone="info",
+        )
+        self._btn_native_thermal = ui_theme.round_button(
+            self._camera_top_row, object_name="camThermalBtn", icon_name="vama_ir", size=_cam_small,
+            tooltip=(
+                "Thermal IR camera (C13: one RTSP stream — switches between day and thermal; "
+                "gimbal control unchanged)"
+            ),
+            checkable=True,
+        )
+        self._btn_native_thermal.hide()
+        # Thermal colour mode (M12): a strip of the mode in use; a click lists the others.
+        self._btn_native_palette = ui_theme.round_button(
+            self._camera_top_row, object_name="camPaletteBtn", size=_cam_small,
+        )
+        self._btn_native_palette.hide()
+        # The camera's torch (row B27): only for a camera with one (_sync_native_torch_button).
+        self._btn_native_torch = ui_theme.round_button(
+            self._camera_top_row, object_name="camTorchBtn", icon_name="vama_torch", size=_cam_small,
+            tooltip="The camera's torch, on or off", checkable=True, tone="torch",
+        )
+        self._btn_native_torch.hide()
+        ctr_layout.addWidget(self._btn_native_split, 0, 0)
+        ctr_layout.addWidget(self._btn_native_follow, 0, 1)
+        ctr_layout.addWidget(self._btn_native_thermal, 1, 0)
+        ctr_layout.addWidget(self._btn_native_palette, 1, 1)
+        ctr_layout.addWidget(self._btn_native_torch, 2, 0)
 
-        self._btn_native_zoom_minus = QPushButton("−")
-        self._btn_native_zoom_plus = QPushButton("+")
-        self._btn_native_zoom_minus.setToolTip("Zoom out")
-        self._btn_native_zoom_plus.setToolTip("Zoom in")
-        self._btn_native_focus_minus = QPushButton("−")
-        self._btn_native_focus_plus = QPushButton("+")
-        self._btn_native_focus_minus.setToolTip("Focus nearer")
-        self._btn_native_focus_plus.setToolTip("Focus farther")
-        self._btn_native_gimbal_up = QPushButton("↑")
-        self._btn_native_gimbal_down = QPushButton("↓")
-        self._btn_native_gimbal_left = QPushButton("←")
-        self._btn_native_gimbal_right = QPushButton("→")
-        self._btn_native_gimbal_center = QPushButton("⌂")
-        self._btn_native_gimbal_nadir = QPushButton("90°")
-        self._btn_native_target = QPushButton("Target")
-        self._btn_native_target.setCheckable(True)
-        self._btn_native_clip = QPushButton("Clip")
-        self._btn_native_report = QPushButton("Report")
-        self._btn_native_report.setObjectName("observeReport")
-        self._btn_native_reset = QPushButton("Reset")
-        self._btn_native_reset.setObjectName("observeReset")
+        # Track (the camera follows an object) and Follow Me (the DRONE follows it), named because
+        # Follow flies the drone. Not the "Follow vehicle" switch above, which moves the map.
         self._btn_native_m13_track = QPushButton("Track")
         self._btn_native_m13_track.setCheckable(True)
         self._btn_native_m13_track.hide()
@@ -1296,79 +642,148 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_follow_object = QPushButton("Follow")
         self._btn_follow_object.setObjectName("followObject")
         self._btn_follow_object.setCheckable(True)
-        for b in (
-            self._btn_native_gimbal_up,
-            self._btn_native_gimbal_down,
-            self._btn_native_gimbal_left,
-            self._btn_native_gimbal_right,
-            self._btn_native_gimbal_center,
-            self._btn_native_gimbal_nadir,
-        ):
-            _cam_pad_btn(b)
+        m13_track_body = CamM13TrackBlock(self._btn_native_m13_track, self._btn_follow_object, self._native_hud_right)
+        self._native_m13_track_body = m13_track_body
+        m13_track_body.hide()
 
-        self._btn_native_gimbal_left.setToolTip("Gimbal yaw left — press and hold")
-        self._btn_native_gimbal_up.setToolTip("Gimbal pitch up — press and hold")
-        self._btn_native_gimbal_right.setToolTip("Gimbal yaw right — press and hold")
-        self._btn_native_gimbal_down.setToolTip("Gimbal pitch down — press and hold")
-        self._btn_native_gimbal_center.setToolTip("Recenter gimbal (yaw and pitch to 0°)")
-        self._btn_native_gimbal_nadir.setToolTip(
-            "Point gimbal straight down (default −90° pitch; set camera/gimbal_nadir_pitch_deg to 90 if needed)"
+        # Observe: opens the Observe panel beside the bar, and closes it again.
+        self._btn_native_observe = QPushButton("Observe", self._native_hud_right)
+        self._btn_native_observe.setObjectName("camObserveBtn")
+        self._btn_native_observe.setCheckable(True)
+        self._btn_native_observe.setIcon(ui_theme.icon("observe", 16))
+        self._btn_native_observe.setIconSize(QSize(16, 16))
+        self._btn_native_observe.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_observe.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_native_observe.setToolTip(
+            "Observe and DOOAF: Target, Clip, Report, Reset, Set TGT, Set HIT, the laser switch and DOOAF Setup.\n"
+            "The panel stays open until you close it."
         )
 
-        gimbal_pad = CamRailGimbalPad(
-            [
-                [
-                    self._btn_native_gimbal_left,
-                    self._btn_native_gimbal_up,
-                    self._btn_native_gimbal_right,
-                ],
-                [
-                    self._btn_native_gimbal_center,
-                    self._btn_native_gimbal_down,
-                    self._btn_native_gimbal_nadir,
-                ],
-            ],
-            btn_height=_CAM_RAIL_PAD_BTN_H,
-            btn_width=_CAM_RAIL_PAD_BTN_W,
-            grid_gap=_CAM_RAIL_GIMBAL_GRID_GAP,
+        self._btn_native_rail_hide = ui_theme.round_button(
+            self._native_hud_right, object_name="camRailHideBtn", icon_name="arrow_right", size=28,
+            tooltip="Hide camera panel",
         )
+        self._btn_native_rail_hide.clicked.connect(lambda: self._set_camera_rail_panel_visible(False))
+
+        _bar = self._native_hud_right_layout
+        _bar.addWidget(mode_row, 0, Qt.AlignmentFlag.AlignHCenter)
+        _bar.addWidget(self._btn_native_record, 0, Qt.AlignmentFlag.AlignHCenter)
+        _bar.addWidget(self._lbl_native_cam_timer, 0, Qt.AlignmentFlag.AlignHCenter)
+        _bar.addWidget(self._camera_top_row, 0, Qt.AlignmentFlag.AlignHCenter)
+        _bar.addWidget(m13_track_body)
+        _bar.addWidget(self._btn_native_observe)
+        _bar.addWidget(self._btn_native_rail_hide, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        # --- The gimbal and lens pad ------------------------------------------------------------------
+        self._native_gimbal_panel = QFrame(self._native_rail_layer)
+        self._native_gimbal_panel.setObjectName("cameraGimbalPanel")
+        self._native_gimbal_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._native_gimbal_panel.setAutoFillBackground(False)
+        pad_lay = QGridLayout(self._native_gimbal_panel)
+        pad_lay.setContentsMargins(_cam_m + 2, _cam_m + 2, _cam_m + 2, _cam_m + 2)
+        pad_lay.setHorizontalSpacing(6)
+        pad_lay.setVerticalSpacing(6)
+
+        def _pad_button(icon_name: str, tooltip: str, *, size: int = _cam_btn) -> QPushButton:
+            b = QPushButton(self._native_gimbal_panel)
+            b.setToolTip(tooltip)
+            return ui_theme.style_round_button(b, icon_name=icon_name, size=size, tone="plain")
+
+        self._btn_native_gimbal_up = _pad_button("arrow_up", "Gimbal pitch up — press and hold")
+        self._btn_native_gimbal_down = _pad_button("arrow_down", "Gimbal pitch down — press and hold")
+        self._btn_native_gimbal_left = _pad_button("arrow_left", "Gimbal yaw left — press and hold")
+        self._btn_native_gimbal_right = _pad_button("arrow_right", "Gimbal yaw right — press and hold")
+        self._btn_native_gimbal_center = _pad_button("vama_center", "Recenter gimbal (yaw and pitch to 0°)")
+        self._btn_native_gimbal_nadir = _pad_button(
+            "vama_down",
+            "Point gimbal straight down (default −90° pitch; set camera/gimbal_nadir_pitch_deg to 90 if needed)",
+        )
+        self._btn_native_zoom_plus = _pad_button("vama_zoom_in", "Zoom in")
+        self._btn_native_zoom_minus = _pad_button("vama_zoom_out", "Zoom out")
+        self._lbl_camera_top_zoom = QLabel(_format_video_zoom_label(1.0), self._native_gimbal_panel)
+        self._lbl_camera_top_zoom.setObjectName("camMagnificationLabel")
+        self._lbl_camera_top_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_camera_top_zoom.setToolTip("Camera magnification")
+        self._lbl_camera_top_zoom.setFixedWidth(_cam_btn + 12)
+
+        focus_row = QWidget(self._native_gimbal_panel)
+        focus_row.setObjectName("cameraFocusRow")
+        focus_lay = QHBoxLayout(focus_row)
+        focus_lay.setContentsMargins(0, 0, 0, 0)
+        focus_lay.setSpacing(6)
+        self._btn_native_focus_minus = _pad_button("focus_near", "Focus nearer", size=32)
+        self._btn_native_focus_plus = _pad_button("focus_far", "Focus farther", size=32)
+        focus_cap = QLabel("Focus", focus_row)
+        focus_cap.setObjectName("camPanelTitle")
+        focus_lay.addStretch(1)
+        focus_lay.addWidget(self._btn_native_focus_minus)
+        focus_lay.addWidget(focus_cap)
+        focus_lay.addWidget(self._btn_native_focus_plus)
+        focus_lay.addStretch(1)
+
+        # A cross of arrows round the centre button, looking down in the corner; the zoom beside it.
+        pad_lay.addWidget(self._btn_native_gimbal_nadir, 0, 0)
+        pad_lay.addWidget(self._btn_native_gimbal_up, 0, 1)
+        pad_lay.addWidget(self._btn_native_gimbal_left, 1, 0)
+        pad_lay.addWidget(self._btn_native_gimbal_center, 1, 1)
+        pad_lay.addWidget(self._btn_native_gimbal_right, 1, 2)
+        pad_lay.addWidget(self._btn_native_gimbal_down, 2, 1)
+        pad_lay.setColumnMinimumWidth(3, 4)
+        pad_lay.addWidget(self._btn_native_zoom_plus, 0, 4, Qt.AlignmentFlag.AlignHCenter)
+        pad_lay.addWidget(self._lbl_camera_top_zoom, 1, 4, Qt.AlignmentFlag.AlignCenter)
+        pad_lay.addWidget(self._btn_native_zoom_minus, 2, 4, Qt.AlignmentFlag.AlignHCenter)
+        pad_lay.addWidget(focus_row, 3, 0, 1, 5)
+
+        # --- The Observe panel ------------------------------------------------------------------------
+        self._native_observe_panel = QFrame(self._native_rail_layer)
+        self._native_observe_panel.setObjectName("cameraObservePanel")
+        self._native_observe_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._native_observe_panel.setAutoFillBackground(False)
+        obs_lay = QVBoxLayout(self._native_observe_panel)
+        obs_lay.setContentsMargins(_cam_m + 4, _cam_m, _cam_m + 4, _cam_m + 4)
+        obs_lay.setSpacing(6)
+        obs_head = QWidget(self._native_observe_panel)
+        obs_head.setObjectName("cameraObserveHeader")
+        obs_head_lay = QHBoxLayout(obs_head)
+        obs_head_lay.setContentsMargins(0, 0, 0, 0)
+        obs_title = QLabel("Observe", obs_head)
+        obs_title.setObjectName("camPanelTitle")
+        self._btn_native_observe_close = ui_theme.round_button(
+            obs_head, object_name="camObserveCloseBtn", icon_name="close", size=26, tooltip="Close the Observe panel"
+        )
+        obs_head_lay.addWidget(obs_title, 1, Qt.AlignmentFlag.AlignVCenter)
+        obs_head_lay.addWidget(self._btn_native_observe_close, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._btn_native_target = QPushButton("Target")
+        self._btn_native_target.setCheckable(True)
+        self._btn_native_clip = QPushButton("Clip")
+        self._btn_native_report = QPushButton("Report")
+        self._btn_native_report.setObjectName("observeReport")
+        self._btn_native_reset = QPushButton("Reset")
+        self._btn_native_reset.setObjectName("observeReset")
         observe_body = CamObserveBlock(
             self._btn_native_target,
             self._btn_native_clip,
             self._btn_native_report,
             self._btn_native_reset,
+            self._native_observe_panel,
         )
         self._native_observe_body = observe_body
-        m13_track_body = CamM13TrackBlock(self._btn_native_m13_track, self._btn_follow_object)
-        self._native_m13_track_body = m13_track_body
-        m13_track_body.hide()
+        obs_lay.addWidget(obs_head)
+        obs_lay.addWidget(observe_body)
+        self._native_observe_panel.setFixedWidth(ui_theme.OBSERVE_PANEL_WIDTH)
+        self._native_observe_panel.hide()
+        self._btn_native_observe.toggled.connect(self._set_observe_panel_open)
+        self._btn_native_observe_close.clicked.connect(lambda: self._set_observe_panel_open(False))
+        if self._observe_panel_open_pref():
+            self._btn_native_observe.setChecked(True)
 
-        self._native_hud_right_layout.addWidget(_cam_rail_sep())
-        self._native_hud_right_layout.addWidget(
-            _cam_rail_lens_row(
-                self._btn_native_zoom_minus,
-                self._btn_native_zoom_plus,
-                self._btn_native_focus_minus,
-                self._btn_native_focus_plus,
-            )
-        )
-        self._native_hud_right_layout.addWidget(
-            _cam_rail_gimbal_row("GIMBAL", gimbal_pad)
-        )
-        self._native_hud_right_layout.addWidget(
-            _cam_rail_inline_row("OBSERVE", observe_body)
-        )
-        self._native_hud_right_layout.addWidget(
-            _cam_rail_inline_row("TRACK", m13_track_body)
-        )
-
-        self._native_hud_right.setMinimumWidth(_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX)
         self._native_hud_right.hide()
         self._native_rail_layer.hide()
 
         self._btn_camera_rail_show = CamRailShowHandle(
             self._panel,
-            icon=_git_cam_icon_from_svg(_GIT_CAM_VIDEO_SVG, 22),
+            icon=ui_theme.icon("vama_photo", 22),
         )
         self._btn_camera_rail_show.clicked.connect(
             lambda: self._set_camera_rail_panel_visible(True)
@@ -1401,190 +816,70 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._obstacle_radar.bar_range_chosen.connect(self.obstacle_bar_range_chosen.emit)
         self._obstacle_radar.hide()
 
-        # Legacy Web `#actionRail` / `.actionBtn` — parent `_panel` (not `_map_canvas`) so Takeoff/Return
-        # stay above fullscreen RTSP video; raising the video label every frame no longer covers them.
+        # The flight buttons: one strip like QGC's tool strip in the app (2026-11-09 restyle), five
+        # buttons of one size, each with its icon and its name. Until then they had three heights, and
+        # Land showed an empty space where its icon should be (it asked for a "down" icon the footer's
+        # icon class does not draw). Parent `_panel` (not `_map_canvas`), so they stay above the video.
         self._map_action_rail = QFrame(self._panel)
         self._map_action_rail.setObjectName("mapActionRail")
-        self._map_action_rail.setStyleSheet(
-            "QFrame#mapActionRail { background: transparent; border: none; }"
-        )
+        self._map_action_rail.setStyleSheet(ui_theme.flight_rail_qss())
         ar_l = QVBoxLayout(self._map_action_rail)
-        ar_l.setContentsMargins(0, 0, 0, 0)
-        ar_l.setSpacing(8)
-        _map_action_btn_base_ss = (
-            "QPushButton#mapActionTakeoffBtn, QPushButton#mapActionReturnBtn {"
-            "min-width:54px; max-width:54px; min-height:54px; max-height:54px;"
-            "border:1px solid rgba(255,255,255,0.35);"
-            "background:rgba(34,42,56,0.92);"
-            "color:#c8d3ea;"
-            "font:600 11px \"Segoe UI\", Arial, sans-serif;"
-            "padding:0px;"
-            "outline:none;"
-            "}"
-            "QPushButton#mapActionTakeoffBtn:hover:enabled, QPushButton#mapActionReturnBtn:hover:enabled {"
-            "background:rgba(46,58,78,0.95);"
-            "border-color:rgba(136,164,205,0.7);"
-            "}"
-            "QPushButton#mapActionTakeoffBtn:disabled, QPushButton#mapActionReturnBtn:disabled { opacity:0.45; }"
-        )
-        _takeoff_ss = (
-            _map_action_btn_base_ss
-            + "QPushButton#mapActionTakeoffBtn {"
-            "border-top-left-radius:8px; border-bottom-left-radius:0px;"
-            "border-top-right-radius:0px; border-bottom-right-radius:0px;"
-            "}"
-        )
-        _return_ss = (
-            _map_action_btn_base_ss
-            + "QPushButton#mapActionReturnBtn {"
-            "border-top-left-radius:0px; border-bottom-left-radius:8px;"
-            "border-top-right-radius:0px; border-bottom-right-radius:0px;"
-            "}"
-        )
-        self._map_action_takeoff_btn = QPushButton(self._map_action_rail)
-        self._map_action_takeoff_btn.setObjectName("mapActionTakeoffBtn")
-        self._map_action_takeoff_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._map_action_takeoff_btn.setFlat(True)
-        self._map_action_takeoff_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._map_action_takeoff_btn.setToolTip(
-            "NAV_TAKEOFF at main Takeoff alt (m). Connect vehicle first (same as dashboard Takeoff)."
-        )
-        _to_lay = QVBoxLayout()
-        _to_lay.setContentsMargins(3, 5, 3, 5)
-        _to_lay.setSpacing(1)
-        _to_ic = TelemetryStripIcon("up", self._map_action_takeoff_btn, icon_size=_MAP_ACTION_ICON_LOGICAL_PX)
-        _to_lbl = QLabel("Takeoff", self._map_action_takeoff_btn)
-        _to_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        _to_lbl.setStyleSheet(
-            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
-        )
-        _to_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        _to_lay.addWidget(_to_ic, 0, Qt.AlignmentFlag.AlignHCenter)
-        _to_lay.addWidget(_to_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
-        self._map_action_takeoff_btn.setLayout(_to_lay)
-        self._map_action_takeoff_btn.setStyleSheet(_takeoff_ss)
+        _pad = ui_theme.FLIGHT_RAIL_PADDING
+        ar_l.setContentsMargins(_pad, _pad, _pad, _pad)
+        ar_l.setSpacing(ui_theme.FLIGHT_RAIL_SPACING)
 
-        self._map_action_return_btn = QPushButton(self._map_action_rail)
-        self._map_action_return_btn.setObjectName("mapActionReturnBtn")
-        self._map_action_return_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._map_action_return_btn.setFlat(True)
-        self._map_action_return_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._map_action_return_btn.setToolTip("Return to launch / RTL (same as dashboard Return).")
-        _re_lay = QVBoxLayout()
-        _re_lay.setContentsMargins(3, 5, 3, 5)
-        _re_lay.setSpacing(1)
-        _re_ic = TelemetryStripIcon("return_home", self._map_action_return_btn, icon_size=_MAP_ACTION_ICON_LOGICAL_PX)
-        _re_lbl = QLabel("Return", self._map_action_return_btn)
-        _re_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        _re_lbl.setStyleSheet(
-            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
+        def _flight_button(object_name: str, label: str, icon_name: str, tooltip: str) -> QToolButton:
+            b = QToolButton(self._map_action_rail)
+            b.setObjectName(object_name)
+            b.setText(label)
+            b.setToolTip(tooltip)
+            b.setProperty("vamaIcon", icon_name)
+            b.setIcon(ui_theme.icon(icon_name, ui_theme.FLIGHT_ICON_SIZE))
+            b.setIconSize(QSize(ui_theme.FLIGHT_ICON_SIZE, ui_theme.FLIGHT_ICON_SIZE))
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            b.setFixedSize(ui_theme.FLIGHT_BUTTON_W, ui_theme.FLIGHT_BUTTON_H)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setAutoRaise(True)
+            return b
+
+        self._map_action_takeoff_btn = _flight_button(
+            "mapActionTakeoffBtn",
+            "Takeoff",
+            "takeoff",
+            "NAV_TAKEOFF at main Takeoff alt (m). Connect vehicle first (same as dashboard Takeoff).",
         )
-        _re_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        _re_lay.addWidget(_re_ic, 0, Qt.AlignmentFlag.AlignHCenter)
-        _re_lay.addWidget(_re_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
-        self._map_action_return_btn.setLayout(_re_lay)
-        self._map_action_return_btn.setStyleSheet(_return_ss)
         # Land belongs beside Takeoff and Return. Requested 2026-09-10, where
         # the whole flight is described from these buttons: "user can click on
         # the take off button ... after that same for land or return button".
         # Land existed only on the dashboard, so the one screen an operator
         # flies from could start a flight but not finish one.
-        _land_ss = _map_action_btn_base_ss.replace(
-            "mapActionTakeoffBtn", "mapActionLandBtn"
-        ).replace("mapActionReturnBtn", "mapActionLandBtn")
-        self._map_action_land_btn = QPushButton(self._map_action_rail)
-        self._map_action_land_btn.setObjectName("mapActionLandBtn")
-        self._map_action_land_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._map_action_land_btn.setFlat(True)
-        self._map_action_land_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._map_action_land_btn.setToolTip(
-            "Land where the aircraft is now (same as dashboard Land)."
+        self._map_action_land_btn = _flight_button(
+            "mapActionLandBtn", "Land", "land", "Land where the aircraft is now (same as dashboard Land)."
         )
-        _la_lay = QVBoxLayout()
-        _la_lay.setContentsMargins(3, 5, 3, 5)
-        _la_lay.setSpacing(1)
-        _la_ic = TelemetryStripIcon(
-            "down", self._map_action_land_btn, icon_size=_MAP_ACTION_ICON_LOGICAL_PX
-        )
-        _la_lbl = QLabel("Land", self._map_action_land_btn)
-        _la_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        _la_lbl.setStyleSheet(
-            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
-        )
-        _la_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        _la_lay.addWidget(_la_ic, 0, Qt.AlignmentFlag.AlignHCenter)
-        _la_lay.addWidget(_la_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
-        self._map_action_land_btn.setLayout(_la_lay)
-        self._map_action_land_btn.setStyleSheet(_land_ss)
-        # Type a position and go there. Requested 2026-09-08: "if I put the lat
         # Stop the motors after a normal landing. Requested 2026-09-11: until
         # now the only disarm in VGCS was EMERGENCY STOP, which forces past
-        # every check and is meant for a runaway. Short like Go to, because it
-        # carries a label and no icon.
-        _disarm_ss = (
-            _map_action_btn_base_ss.replace("mapActionTakeoffBtn", "mapActionDisarmBtn")
-            .replace("mapActionReturnBtn", "mapActionDisarmBtn")
-            + "QPushButton#mapActionDisarmBtn {"
-            "min-height:34px; max-height:34px;"
-            "}"
-        )
-        self._map_action_disarm_btn = QPushButton(self._map_action_rail)
-        self._map_action_disarm_btn.setObjectName("mapActionDisarmBtn")
-        self._map_action_disarm_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._map_action_disarm_btn.setFlat(True)
-        self._map_action_disarm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._map_action_disarm_btn.setToolTip(
+        # every check and is meant for a runaway.
+        self._map_action_disarm_btn = _flight_button(
+            "mapActionDisarmBtn",
+            "Disarm",
+            "disarm",
             "Stop the motors after landing. The aircraft refuses this while it\n"
-            "still believes it is flying; use EMERGENCY STOP for a runaway."
+            "still believes it is flying; use EMERGENCY STOP for a runaway.",
         )
-        _di_lay = QVBoxLayout()
-        _di_lay.setContentsMargins(3, 5, 3, 5)
-        _di_lay.setSpacing(1)
-        _di_lbl = QLabel("Disarm", self._map_action_disarm_btn)
-        _di_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _di_lbl.setStyleSheet(
-            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
+        self._map_action_return_btn = _flight_button(
+            "mapActionReturnBtn", "Return", "return_home", "Return to launch / RTL (same as dashboard Return)."
         )
-        _di_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        _di_lay.addWidget(_di_lbl, 0, Qt.AlignmentFlag.AlignCenter)
-        self._map_action_disarm_btn.setLayout(_di_lay)
-        self._map_action_disarm_btn.setStyleSheet(_disarm_ss)
+        # Type a position and go there. Requested 2026-09-08: "if I put the lat
         # long then I can see that particular location on the map". Unlike the
-        # two above it needs no vehicle, so it is never disabled.
-        _goto_ss = (
-            _map_action_btn_base_ss.replace("mapActionTakeoffBtn", "mapActionGotoBtn")
-            .replace("mapActionReturnBtn", "mapActionGotoBtn")
-            + "QPushButton#mapActionGotoBtn {"
-            "border-top-left-radius:0px; border-bottom-left-radius:8px;"
-            "border-top-right-radius:0px; border-bottom-right-radius:8px;"
-            # It carries a label and no icon, so it does not need a full tile.
-            # The base rule clamps every rail button to 54, which is why the
-            # "shorter Go to button" the old constant described was never
-            # actually shorter. Four full tiles crowd the left edge.
-            "min-height:34px; max-height:34px;"
-            "}"
-        )
-        self._map_action_goto_btn = QPushButton(self._map_action_rail)
-        self._map_action_goto_btn.setObjectName("mapActionGotoBtn")
-        self._map_action_goto_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._map_action_goto_btn.setFlat(True)
-        self._map_action_goto_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._map_action_goto_btn.setToolTip(
+        # others it needs no vehicle, so it is never disabled.
+        self._map_action_goto_btn = _flight_button(
+            "mapActionGotoBtn",
+            "Go to",
+            "goto",
             "Go to a position you type in: latitude and longitude, or a grid\n"
-            "reference. Also on Ctrl+G, which works while planning too."
+            "reference. Also on Ctrl+G, which works while planning too.",
         )
-        _go_lay = QVBoxLayout()
-        _go_lay.setContentsMargins(3, 5, 3, 5)
-        _go_lay.setSpacing(1)
-        _go_lbl = QLabel("Go to", self._map_action_goto_btn)
-        _go_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _go_lbl.setStyleSheet(
-            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
-        )
-        _go_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        _go_lay.addWidget(_go_lbl, 0, Qt.AlignmentFlag.AlignCenter)
-        self._map_action_goto_btn.setLayout(_go_lay)
-        self._map_action_goto_btn.setStyleSheet(_goto_ss)
 
         ar_l.addWidget(self._map_action_takeoff_btn)
         ar_l.addWidget(self._map_action_land_btn)
@@ -1615,7 +910,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         # pixels short and pushed Go to outside its own parent, where it is
         # simply not drawn.
         ar_l.activate()
-        self._map_action_rail.setFixedSize(54, max(158, ar_l.sizeHint().height()))
+        self._map_action_rail.setFixedSize(ar_l.sizeHint())
         self._map_action_rail.show()
         self._map_action_rail.raise_()
 
@@ -1642,7 +937,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._native_minimap_wrap.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._native_minimap_wrap.setAutoFillBackground(False)
         self._native_minimap_wrap.setStyleSheet(
-            "QFrame#nativeMinimapWrap { background: transparent; border: 1px solid rgba(132,152,190,0.45); border-radius: 8px; }"
+            "QFrame#nativeMinimapWrap { background: transparent; border: 1px solid rgba(255, 255, 255, 110); border-radius: 10px; }"
         )
         self._native_minimap_wrap.hide()
 
@@ -1675,29 +970,17 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         # Larger, high-contrast controls so +/− stay readable over satellite tiles when swap shows the map PiP.
         self._native_minimap_btn_side = 32
         self._native_minimap_btn_pad = 8
-        self._btn_native_minimap_plus = QPushButton("+", self._native_minimap_wrap)
-        self._btn_native_minimap_minus = QPushButton("-", self._native_minimap_wrap)
-        _mini_f = QFont()
-        _mini_f.setPointSize(16)
-        _mini_f.setWeight(QFont.Weight.Black)
-        _mini_ss = (
-            "QPushButton {"
-            "background-color: rgba(18, 26, 40, 0.88);"
-            "color: #f5f8ff;"
-            "border: 2px solid rgba(200, 218, 255, 0.95);"
-            "border-radius: 6px;"
-            "padding: 0px;"
-            "}"
-            "QPushButton:hover { background-color: rgba(32, 46, 68, 0.92); border-color: #ffffff; color: #ffffff; }"
-            "QPushButton:pressed { background-color: rgba(12, 18, 28, 0.95); border-color: #9eb6e8; }"
-        )
-        for b in (self._btn_native_minimap_plus, self._btn_native_minimap_minus):
-            b.setFont(_mini_f)
-            b.setFixedSize(self._native_minimap_btn_side, self._native_minimap_btn_side)
-            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_minimap_plus = QPushButton(self._native_minimap_wrap)
+        self._btn_native_minimap_minus = QPushButton(self._native_minimap_wrap)
+        # The app's round buttons, as on the main map's zoom (2026-11-09 restyle).
+        for b, icon_name, tip in (
+            (self._btn_native_minimap_plus, "plus", "Zoom the small map in"),
+            (self._btn_native_minimap_minus, "minus", "Zoom the small map out"),
+        ):
+            ui_theme.style_round_button(b, icon_name=icon_name, size=self._native_minimap_btn_side, tone="plain")
+            b.setToolTip(tip)
             b.setAutoDefault(False)
             b.setDefault(False)
-            b.setStyleSheet(_mini_ss)
             b.hide()
             b.raise_()
         self._btn_native_minimap_plus.clicked.connect(self._on_native_minimap_plus_clicked)

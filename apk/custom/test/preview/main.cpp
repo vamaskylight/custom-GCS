@@ -3566,8 +3566,9 @@ int main(int argc, char *argv[])
              const QString says = storage ? storage->property("text").toString() : QString();
              expect(storage && storage->isVisible() &&
                         says == QStringLiteral("The camera saves its photos and videos on its own SD card. The camera says it has no SD card. "
-                                               "A copy of each is saved on this remote control, in VAMA-GCS/Photo and VAMA-GCS/Video."),
-                    "camera settings: where photos and videos go, and what the camera says of its SD card", says);
+                                               "A copy of each is saved on this remote control, in VAMA-GCS/Photo and VAMA-GCS/Video. "
+                                               "Folder on this RC: /storage/emulated/0/VAMA-GCS"),
+                    "camera settings: where photos and videos go, the whole folder, and what the camera says of its SD card", says);
              // B30: QGC saves on the RC's SD card when it can (most likely where the client's copy was), and a
              // customer's own build has its own name, so its own folder.
              global.settings.app.setPlace(QStringLiteral("/storage/1A2B-3C4D"), QStringLiteral("Customer GCS"));
@@ -3577,7 +3578,8 @@ int main(int argc, char *argv[])
              const bool asked = layer && QMetaObject::invokeMethod(layer, "_rcPlace", Q_RETURN_ARG(QVariant, place),
                                                                    Q_ARG(QVariant, QVariant(QStringLiteral("Video"))));
              expect(cardSays.endsWith(QStringLiteral("A copy of each is saved on this remote control's SD card, "
-                                                     "in Customer GCS/Photo and Customer GCS/Video.")) &&
+                                                     "in Customer GCS/Photo and Customer GCS/Video. "
+                                                     "Folder on this RC: /storage/1A2B-3C4D/Customer GCS")) &&
                         asked && place.toString() == QStringLiteral("on this RC's SD card, in Customer GCS/Video"),
                     "RC copies: the notes name the app's own folder, and the SD card when QGC saves there",
                     cardSays + QStringLiteral(" | ") + place.toString());

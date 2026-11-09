@@ -78,6 +78,11 @@ def check_bundled_files() -> str:
         root / "Vama Logo.png",
         root / "header_icons" / "gps.svg",
         root / "menu_icons" / "plan_flight.svg",
+        # The line icons of the 2026-11-09 restyle: the flight buttons, the camera panels, the map zoom.
+        root / "ui_icons" / "takeoff.svg",
+        root / "ui_icons" / "land.svg",
+        root / "ui_icons" / "vama_record.svg",
+        root / "ui_icons" / "arrow_down.svg",
         root / "vendor" / "leaflet" / "leaflet.js",
         # The 3D view: the library, one of its workers, its styles, and the
         # small world picture it draws with no internet.

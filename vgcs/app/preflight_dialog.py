@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vgcs.app import ui_theme
 from vgcs.app.preflight_checklist import (
     STATUS_FAIL,
     STATUS_PASS,
@@ -49,10 +50,10 @@ from vgcs.app.preflight_checklist import (
 _REFRESH_MS = 500
 
 _TICK_STYLE = {
-    STATUS_PASS: ("✔", "#16a34a"),
-    STATUS_FAIL: ("✖", "#dc2626"),
+    STATUS_PASS: ("✔", ui_theme.GREEN),
+    STATUS_FAIL: ("✖", ui_theme.RED_TEXT),
 }
-_TICK_UNKNOWN = ("…", "#94a3b8")
+_TICK_UNKNOWN = ("…", ui_theme.TEXT_FAINT)
 
 _MOTOR_TEST_TOOLTIP = (
     "Spins each motor briefly at low throttle, in board output order."
@@ -86,7 +87,7 @@ class PreflightDialog(QDialog):
 
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color:#e2e8f0;")
+        line.setStyleSheet(f"color:{ui_theme.BORDER};")
         root.addWidget(line)
 
         self._rows_host = QVBoxLayout()
@@ -100,7 +101,7 @@ class PreflightDialog(QDialog):
             "GPS and battery here are for information."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color:#64748b;font-size:11px;")
+        note.setStyleSheet(f"color:{ui_theme.TEXT_FAINT};font-size:11px;")
         root.addWidget(note)
 
         buttons = QHBoxLayout()
@@ -231,7 +232,7 @@ class PreflightDialog(QDialog):
         self._summary.setText(checklist_summary(checks))
         self._summary.setStyleSheet(
             "font-size:15px;font-weight:700;color:"
-            + ("#15803d" if ready else "#b45309")
+            + (ui_theme.GREEN if ready else ui_theme.ORANGE)
             + ";"
         )
 
@@ -250,7 +251,7 @@ class PreflightDialog(QDialog):
         label.setStyleSheet("font-weight:600;")
         detail = QLabel("")
         detail.setWordWrap(True)
-        detail.setStyleSheet("color:#475569;font-size:12px;")
+        detail.setStyleSheet(f"color:{ui_theme.TEXT_DIM};font-size:12px;")
         text.addWidget(label)
         text.addWidget(detail)
         row.addLayout(text, 1)

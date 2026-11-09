@@ -667,6 +667,13 @@ Item {
         var path = _appSettings ? (kind === "Photo" ? _appSettings.photoSavePath : _appSettings.videoSavePath) : ""
         return (_rcOnCard(path) ? qsTr("on this RC's SD card, in %1") : qsTr("on this RC, in %1")).arg(_rcFolder(path, kind))
     }
+    // The whole folder QGC saves in, for the camera settings: the client's RC has no SD card, and their
+    // Files app showed no VAMA-GCS folder at the storage root (row B30, 2026-11-09). "" without one.
+    function _rcSaveFolder() {
+        var video = _appSettings ? String(_appSettings.videoSavePath || "") : ""
+        var cut = video.lastIndexOf("/")
+        return cut > 0 ? video.substring(0, cut) : ""
+    }
     function _rcBothPlaces() {  // "on this remote control, in VAMA-GCS/Photo and VAMA-GCS/Video"
         var photo = _appSettings ? _appSettings.photoSavePath : ""
         var video = _appSettings ? _appSettings.videoSavePath : ""
@@ -2086,11 +2093,12 @@ Item {
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
                     font.pointSize:   ScreenTools.smallFontPointSize
-                    text:             (_link.camera.photo || _link.camera.record)
-                                      ? qsTr("The camera saves its photos and videos on its own SD card.") +
-                                        (_link.sdCardText !== "" ? " " + _link.sdCardText : "") + " " +
-                                        qsTr("A copy of each is saved %1.").arg(_rcBothPlaces())
-                                      : qsTr("Photos and videos of the picture are saved %1.").arg(_rcBothPlaces())
+                    text:             ((_link.camera.photo || _link.camera.record)
+                                       ? qsTr("The camera saves its photos and videos on its own SD card.") +
+                                         (_link.sdCardText !== "" ? " " + _link.sdCardText : "") + " " +
+                                         qsTr("A copy of each is saved %1.").arg(_rcBothPlaces())
+                                       : qsTr("Photos and videos of the picture are saved %1.").arg(_rcBothPlaces()))
+                                      + (_rcSaveFolder() !== "" ? " " + qsTr("Folder on this RC: %1").arg(_rcSaveFolder()) : "")
                 }
 
                 // What the camera itself says about its zoom, to check the zoom number on a C13.

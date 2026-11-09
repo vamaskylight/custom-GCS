@@ -51,7 +51,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QStackedWidget,
     QSpinBox,
-    QStyle,
     QTextEdit,
     QTabWidget,
     QRadioButton,
@@ -67,6 +66,7 @@ from vgcs.app.window.helpers import (
     _settings_truthy,
 )
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app import ui_theme
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
@@ -363,54 +363,13 @@ class MainWindowUiLayoutMixin:
         if getattr(self, "_link_banner_palette_state", None) == st:
             return
         self._link_banner_palette_state = st
-        if st == "green":
-            bg = "rgba(24, 82, 38, 0.96)"
-            bd = "rgba(94, 214, 119, 0.95)"
-            fg = "#e8ffe8"
-            muted = "rgba(232, 255, 232, 0.58)"
-        elif st == "yellow":
-            bg = "rgba(120, 95, 24, 0.96)"
-            bd = "rgba(247, 211, 92, 0.95)"
-            fg = "#fff7dd"
-            muted = "rgba(255, 247, 221, 0.58)"
-        elif st == "red":
-            bg = "rgba(124, 24, 24, 0.96)"
-            bd = "rgba(245, 99, 99, 0.95)"
-            fg = "#ffe8e8"
-            muted = "rgba(255, 232, 232, 0.58)"
-        else:
-            bg = "rgba(24, 30, 40, 0.96)"
-            bd = "rgba(72, 86, 110, 0.9)"
-            fg = "#dbe3f3"
-            muted = "rgba(244, 247, 255, 0.52)"
-
-        qss = "\n".join(
-            (
-                f"QFrame#headerBar {{ background-color: {bg}; border-bottom: 1px solid {bd}; }}",
-                f"QLabel#hdrPillTitle {{ color: {muted}; }}",
-                f"QLabel#hdrPillValue {{ color: {fg}; }}",
-                f"QLabel#hdrGpsStackLine {{ color: {fg}; }}",
-                "QPushButton#headerFlightChipBtn { background: transparent; border: none; "
-                f"color: {fg}; font-weight: 700; font-size: 14px; padding: 2px 4px; }}",
-                "QPushButton#headerFlightChipBtn:hover { background-color: rgba(255,255,255,0.08); }",
-                f"QLabel#linkBannerText {{ color: {fg}; font-size: 14px; font-weight: 600; }}",
-                "QPushButton#hdrConnectBtn, QPushButton#hdrDisconnectBtn {"
-                f" color: {fg}; font-size: 13px; font-weight: 700; padding: 4px 12px; "
-                " border-radius: 8px; border: 1px solid rgba(255,255,255,0.22); }",
-                "QPushButton#hdrConnectBtn { background-color: rgba(62, 126, 232, 0.20); }",
-                "QPushButton#hdrConnectBtn:hover { background-color: rgba(62, 126, 232, 0.34); }",
-                "QPushButton#hdrDisconnectBtn { background-color: rgba(210, 60, 60, 0.18); }",
-                "QPushButton#hdrDisconnectBtn:hover { background-color: rgba(210, 60, 60, 0.30); }",
-                "QPushButton#hdrConnectBtn:disabled, QPushButton#hdrDisconnectBtn:disabled {"
-                " background-color: rgba(255,255,255,0.08); color: rgba(240,245,255,0.55);"
-                " border: 1px solid rgba(255,255,255,0.14); }",
-            )
-        )
-        self._top_dashboard.setStyleSheet(qss)
+        # The app's look (vgcs/app/ui_theme.py): QGC's dark bar, tinted by the flight state as before.
+        self._top_dashboard.setStyleSheet(ui_theme.header_qss(st))
+        fg = ui_theme.HEADER_STATES.get(st, ui_theme.HEADER_STATES[""])[2]
         self._logo_btn.setStyleSheet(
             f"QPushButton {{ background: transparent; border: none; padding: 0; color: {fg}; "
-            f"font-size: 15px; font-weight: 600; }}"
-            f"QPushButton:hover {{ background-color: rgba(255,255,255,0.06); }}"
+            f"font-size: {ui_theme.FONT_MEDIUM}px; font-weight: 600; border-radius: 6px; }}"
+            "QPushButton:hover { background-color: rgba(255, 255, 255, 20); }"
         )
 
     def _build_m2_top_dashboard(self) -> QFrame:
@@ -438,8 +397,8 @@ class MainWindowUiLayoutMixin:
         self._logo_btn.setCursor(Qt.PointingHandCursor)
         self._logo_btn.setStyleSheet(
             "QPushButton { background: transparent; border: none; padding: 0; "
-            "color: #dbe3f3; font-size: 15px; font-weight: 600; }"
-            "QPushButton:hover { background: transparent; border: none; color: #f4f7ff; }"
+            f"color: {ui_theme.TEXT}; font-size: 15px; font-weight: 600; }}"
+            f"QPushButton:hover {{ background: transparent; border: none; color: {ui_theme.TEXT}; }}"
             "QPushButton:pressed { background: transparent; border: none; }"
         )
         # Legacy Web `__LOGO_SRC__` → shipped asset (see git e48c1a7 map_widget template).
@@ -545,10 +504,13 @@ class MainWindowUiLayoutMixin:
             "remote_id.svg", self._top_remote_id, min_w=88 if self._compact_ui else 96
         )
 
+        _hdr_btn_h = ui_theme.HEADER_BUTTON_HEIGHT
         self._hdr_map_mode_btn = QPushButton("3D")
         self._hdr_map_mode_btn.setObjectName("hdrMapModeBtn")
-        self._hdr_map_mode_btn.setFixedHeight(26)
+        self._hdr_map_mode_btn.setFixedHeight(_hdr_btn_h)
         self._hdr_map_mode_btn.setCursor(Qt.PointingHandCursor)
+        self._hdr_map_mode_btn.setIcon(ui_theme.icon("map_3d", 16))
+        self._hdr_map_mode_btn.setIconSize(QSize(16, 16))
         self._hdr_map_mode_btn.clicked.connect(self._on_map_toggle_3d_requested)
 
         # Emergency motor stop. It used to be only in the M2 controls panel,
@@ -557,19 +519,13 @@ class MainWindowUiLayoutMixin:
         # while Plan Flight hides the map's own buttons.
         self._hdr_estop_btn = QPushButton("E-STOP")
         self._hdr_estop_btn.setObjectName("hdrEstopBtn")
-        self._hdr_estop_btn.setFixedHeight(26)
+        self._hdr_estop_btn.setFixedHeight(_hdr_btn_h)
         self._hdr_estop_btn.setCursor(Qt.PointingHandCursor)
         self._hdr_estop_btn.setToolTip(
             "Emergency stop: the motors stop at once, also in the air, and the aircraft falls.\n"
             "Only when the aircraft is a danger. You type STOP to confirm."
         )
-        self._hdr_estop_btn.setStyleSheet(
-            "QPushButton#hdrEstopBtn { background: #b3261e; color: #ffffff; font-weight: 700;"
-            " border: 1px solid #ff8a80; border-radius: 4px; padding: 0px 10px; }"
-            "QPushButton#hdrEstopBtn:hover:enabled { background: #d32f2f; }"
-            "QPushButton#hdrEstopBtn:disabled { background: rgba(179, 38, 30, 0.35);"
-            " color: rgba(255, 255, 255, 0.5); border-color: rgba(255, 138, 128, 0.35); }"
-        )
+        # Its red is in the header's sheet (ui_theme.header_qss), the same in every flight state.
         self._hdr_estop_btn.setEnabled(False)
         self._hdr_estop_btn.clicked.connect(self._on_emergency_motor_stop)
 
@@ -577,13 +533,8 @@ class MainWindowUiLayoutMixin:
         # header state, because the lost drone need not be the one on screen.
         self._hdr_silence_btn = QPushButton("Silence alarm")
         self._hdr_silence_btn.setObjectName("hdrSilenceAlarmBtn")
-        self._hdr_silence_btn.setFixedHeight(26)
+        self._hdr_silence_btn.setFixedHeight(_hdr_btn_h)
         self._hdr_silence_btn.setCursor(Qt.PointingHandCursor)
-        self._hdr_silence_btn.setStyleSheet(
-            "QPushButton#hdrSilenceAlarmBtn { background: #f9a825; color: #1b1b1b; font-weight: 700;"
-            " border: 1px solid #ffe082; border-radius: 4px; padding: 0px 10px; }"
-            "QPushButton#hdrSilenceAlarmBtn:hover { background: #fbc02d; }"
-        )
         self._hdr_silence_btn.setVisible(False)
         self._hdr_silence_btn.clicked.connect(self._on_silence_alarm_clicked)
 
@@ -648,10 +599,8 @@ class MainWindowUiLayoutMixin:
         self._hdr_connect_btn = QPushButton("Connect")
         self._hdr_connect_btn.setObjectName("hdrConnectBtn")
         self._hdr_connect_btn.setCursor(Qt.PointingHandCursor)
-        self._hdr_connect_btn.setFixedHeight(28)
+        self._hdr_connect_btn.setFixedHeight(_hdr_btn_h)
         self._hdr_connect_btn.setMinimumWidth(112 if self._compact_ui else 124)
-        self._hdr_connect_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
-        self._hdr_connect_btn.setIconSize(QSize(14, 14))
         self._hdr_connect_btn.clicked.connect(self._on_map_connect_requested)
         dd_lay.addWidget(self._hdr_connect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         # The red states (not ready to arm, an arm refused, the link lost) show
@@ -660,10 +609,8 @@ class MainWindowUiLayoutMixin:
         self._hdr_banner_disconnect_btn = QPushButton("Disconnect")
         self._hdr_banner_disconnect_btn.setObjectName("hdrDisconnectBtn")
         self._hdr_banner_disconnect_btn.setCursor(Qt.PointingHandCursor)
-        self._hdr_banner_disconnect_btn.setFixedHeight(28)
+        self._hdr_banner_disconnect_btn.setFixedHeight(_hdr_btn_h)
         self._hdr_banner_disconnect_btn.setMinimumWidth(112 if self._compact_ui else 124)
-        self._hdr_banner_disconnect_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
-        self._hdr_banner_disconnect_btn.setIconSize(QSize(14, 14))
         self._hdr_banner_disconnect_btn.setEnabled(False)
         self._hdr_banner_disconnect_btn.setVisible(False)
         self._hdr_banner_disconnect_btn.clicked.connect(self._on_disconnect_clicked)
@@ -679,10 +626,8 @@ class MainWindowUiLayoutMixin:
         self._hdr_disconnect_btn = QPushButton("Disconnect")
         self._hdr_disconnect_btn.setObjectName("hdrDisconnectBtn")
         self._hdr_disconnect_btn.setCursor(Qt.PointingHandCursor)
-        self._hdr_disconnect_btn.setFixedHeight(28)
+        self._hdr_disconnect_btn.setFixedHeight(_hdr_btn_h)
         self._hdr_disconnect_btn.setMinimumWidth(112 if self._compact_ui else 124)
-        self._hdr_disconnect_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
-        self._hdr_disconnect_btn.setIconSize(QSize(14, 14))
         self._hdr_disconnect_btn.setEnabled(False)
         self._hdr_disconnect_btn.clicked.connect(self._on_disconnect_clicked)
         cc_lay.addWidget(self._hdr_disconnect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -703,6 +648,8 @@ class MainWindowUiLayoutMixin:
         bar.setFixedHeight(chip_row_h + _hdr_pad_v)
         shell.addLayout(header_outer)
         bar.setLayout(shell)
+        # The app's look before the first flight state arrives (_apply_link_banner_palette sets it later).
+        bar.setStyleSheet(ui_theme.header_qss(""))
         return bar
 
     @staticmethod
@@ -731,9 +678,11 @@ class MainWindowUiLayoutMixin:
             return None
 
     def _menu_icon(self, filename: str) -> QIcon:
+        """A menu icon, white for the dark menu (the files are drawn dark, for the light menu of before)."""
         path = vgcs_assets_dir() / "menu_icons" / filename
         if path.exists():
-            return QIcon(str(path))
+            icon = ui_theme.svg_file_icon(path, 20, recolor={c: ui_theme.TEXT for c in ("#111111", "#111827", "#222222", "#374151")})
+            return icon if not icon.isNull() else QIcon(str(path))
         return QIcon()
 
     def _build_mission_list_panel(self) -> QGroupBox:
@@ -941,9 +890,9 @@ class MainWindowUiLayoutMixin:
             k2: str,
         ) -> int:
             l1 = QLabel(t1)
-            l1.setStyleSheet("color: #7d869c;")
+            l1.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
             l2 = QLabel(t2)
-            l2.setStyleSheet("color: #7d869c;")
+            l2.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
             pg.addWidget(l1, r_, 0)
             pg.addWidget(add_field(k1), r_, 1)
             pg.addWidget(l2, r_, 2)
@@ -954,7 +903,7 @@ class MainWindowUiLayoutMixin:
         r = row_pair(r, "Ground speed", "groundspeed", "Air speed", "airspeed")
         r = row_pair(r, "Altitude (rel)", "alt_rel", "Altitude (MSL)", "alt_msl")
         ll = QLabel("Lat / Lon")
-        ll.setStyleSheet("color: #7d869c;")
+        ll.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
         pg.addWidget(ll, r, 0)
         lat_w = add_field("lat_lon")
         pg.addWidget(lat_w, r, 1, 1, 3)
@@ -962,7 +911,7 @@ class MainWindowUiLayoutMixin:
         r = row_pair(r, "Heading", "heading", "Attitude (R/P/Y)", "attitude")
         primary.setLayout(pg)
 
-        systems = QGroupBox("Navigation & systems")
+        systems = QGroupBox("Navigation && systems")
         sg = QGridLayout()
         sg.setHorizontalSpacing(12 if self._compact_ui else 16)
         sg.setVerticalSpacing(6 if self._compact_ui else 8)
@@ -971,9 +920,9 @@ class MainWindowUiLayoutMixin:
         def row_sys(a: str, ka: str, b: str, kb: str) -> None:
             nonlocal sr
             la = QLabel(a)
-            la.setStyleSheet("color: #7d869c;")
+            la.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
             lb = QLabel(b)
-            lb.setStyleSheet("color: #7d869c;")
+            lb.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
             sg.addWidget(la, sr, 0)
             sg.addWidget(add_field(ka), sr, 1)
             sg.addWidget(lb, sr, 2)
@@ -987,22 +936,22 @@ class MainWindowUiLayoutMixin:
         row_sys("Wind", "wind", "Wind failsafe", "wind_failsafe")
         row_sys("RTK", "rtk", "GPS accuracy", "gps_accuracy")
         lc = QLabel("RTK corrections")
-        lc.setStyleSheet("color: #7d869c;")
+        lc.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
         sg.addWidget(lc, sr, 0)
         sg.addWidget(add_field("rtk_corrections"), sr, 1, 1, 3)
         sr += 1
         lp = QLabel("Position source")
-        lp.setStyleSheet("color: #7d869c;")
+        lp.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
         sg.addWidget(lp, sr, 0)
         sg.addWidget(add_field("position_source"), sr, 1, 1, 3)
         sr += 1
         ls = QLabel("Command signing")
-        ls.setStyleSheet("color: #7d869c;")
+        ls.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
         sg.addWidget(ls, sr, 0)
         sg.addWidget(add_field("signing"), sr, 1, 1, 3)
         sr += 1
         la = QLabel("Arm readiness")
-        la.setStyleSheet("color: #7d869c;")
+        la.setStyleSheet(f"color: {ui_theme.TEXT_FAINT};")
         sg.addWidget(la, sr, 0)
         sg.addWidget(add_field("arm_ready"), sr, 1, 1, 3)
         systems.setLayout(sg)
