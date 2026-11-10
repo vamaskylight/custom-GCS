@@ -25,6 +25,12 @@ RENAMED_IN_4_7 = {
     "ARMING_CHECK": "ARMING_SKIPCHK",
 }
 
+# Renamed in ArduPilot 4.6: VGCS reads both names, so that an older firmware answers too. 4.6 and
+# 4.7 have only the new name (seen on SITL 4.6.2 and 4.7.0, 2026-11-10).
+RENAMED_IN_4_6 = {
+    "GPS_TYPE2": "GPS2_TYPE",
+}
+
 # The list under "Set param", in this order. Both names of a renamed setting.
 EDITABLE = (
     "WPNAV_SPEED",
@@ -84,9 +90,8 @@ CHECKED = (
     "RNGFND1_TYPE",
     "RNGFND1_ORIENT",
     # The GPS-denied navigation (A8 step 4, vgcs/app/position_source.py): GPS 2 is the down
-    # camera when it is a MAVLink GPS (14). GPS_TYPE2 is its name before ArduPilot 4.6.
-    "GPS2_TYPE",
-    "GPS_TYPE2",
+    # camera when it is a MAVLink GPS (14). Both names, see RENAMED_IN_4_6.
+    *(name for old, new in RENAMED_IN_4_6.items() for name in (new, old)),
     "GPS_AUTO_SWITCH",
     # Follow Me's question (vgcs/app/follow_drone.py): how long the drone flies its last speed
     # when the speeds stop coming, before it stops (3 s as shipped).

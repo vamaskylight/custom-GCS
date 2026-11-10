@@ -32,7 +32,7 @@ The same set-up as the wind failsafe tests, see [drone/README.md](../drone/READM
 From the repo root:
 
 ```powershell
-py system_test/vgcs_sitl_test.py                      # 17 cases on 4.6.2 and 4.7.0, about 12 minutes
+py system_test/vgcs_sitl_test.py                      # 24 cases on 4.6.2 and 4.7.0, about 27 minutes
 py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
 py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
 
@@ -47,6 +47,9 @@ py system_test/vgcs_fleet_test.py 4.6.2 --report fleet.md
 
 Only one simulator can run at a time (it always uses TCP port 5760).
 Do not run two of these scripts, or a wind failsafe test, at the same time.
+
+For results to report, run each version on its own (`4.6.2`, then `4.7.0`).
+In one run of both, the 4.7.0 cases come after all of 4.6.2's in the same process, and the real-time Follow Me case (`object_follow`) then got about 58 % of the drone's position messages and failed (2026-11-10, twice). Each version on its own passed every case.
 
 ## Live demo: drones to fly by hand
 

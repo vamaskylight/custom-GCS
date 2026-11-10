@@ -1094,6 +1094,28 @@ _SOUP_TILE_ROUGHNESS_MIN = 0.6
 _SOUP_TILE_ROUGHNESS_MIN_TILES = 6
 
 
+def _gray_tiles_8x8(gray: "np.ndarray", step: int) -> "np.ndarray":
+    """The 8x8 tiles at y in range(0, h - 8, step) and x in range(0, w - 8, step), as a
+    (rows, cols, 8, 8) view without a copy: the tiles the old per-tile loops visited, in order."""
+    h, w = gray.shape
+    ny = len(range(0, h - 8, step))
+    nx = len(range(0, w - 8, step))
+    win = np.lib.stride_tricks.sliding_window_view(gray, (8, 8))
+    return win[::step, ::step][:ny, :nx]
+
+
+def _soup_tile_stats(gray: "np.ndarray") -> "tuple[np.ndarray, np.ndarray]":
+    """Each 8x8 tile's contrast (its std) and roughness (mean step across and down, over the std), for
+    tiles every 16 px, in the old loop's order. One pass: the per-tile loop cost about 15 ms a frame (B29)."""
+    tiles = _gray_tiles_8x8(gray, 16)
+    stds = tiles.std(axis=(2, 3)).astype(np.float64).ravel()
+    grad = (
+        np.abs(np.diff(tiles, axis=3)).mean(axis=(2, 3)).astype(np.float64)
+        + np.abs(np.diff(tiles, axis=2)).mean(axis=(2, 3)).astype(np.float64)
+    ).ravel() * 0.5
+    return stds, grad / (stds + 1e-6)
+
+
 def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
     """Full-frame HEVC decode collapse — patchy 8×8 tile chaos across the whole image.
 
@@ -1112,29 +1134,17 @@ def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
     g = arr[:, :, 1].astype(np.float32)
     b = arr[:, :, 2].astype(np.float32)
     gray = 0.299 * r + 0.587 * g + 0.114 * b
-    block_stds: list[float] = []
-    block_rough: list[float] = []
-    step = 16
-    for y in range(0, h - 8, step):
-        for x in range(0, w - 8, step):
-            tile = gray[y : y + 8, x : x + 8]
-            s = float(tile.std())
-            block_stds.append(s)
-            grad = (
-                float(np.abs(np.diff(tile, axis=1)).mean())
-                + float(np.abs(np.diff(tile, axis=0)).mean())
-            ) * 0.5
-            block_rough.append(grad / (s + 1e-6))
-    if len(block_stds) < 12:
+    block_stds, block_rough = _soup_tile_stats(gray)
+    if block_stds.size < 12:
         return False
     med = float(np.median(block_stds))
     std_of_stds = float(np.std(block_stds))
     hi_thr = max(24.0, med * 2.4)
-    hi_rough = [rg for s, rg in zip(block_stds, block_rough) if s > hi_thr]
-    hi = len(hi_rough)
-    lo = sum(1 for s in block_stds if s < max(6.0, med * 0.35))
-    ratio = hi / float(len(block_stds))
-    lo_ratio = lo / float(len(block_stds))
+    hi_rough = block_rough[block_stds > hi_thr]
+    hi = int(hi_rough.size)
+    lo = int(np.count_nonzero(block_stds < max(6.0, med * 0.35)))
+    ratio = hi / float(block_stds.size)
+    lo_ratio = lo / float(block_stds.size)
     if (
         hi >= _SOUP_TILE_ROUGHNESS_MIN_TILES
         and float(np.median(hi_rough)) < _SOUP_TILE_ROUGHNESS_MIN
@@ -1318,8 +1328,6 @@ def _rgb_frame_has_structural_tear(arr: "np.ndarray") -> bool:
     mid = h // 2
     top = gray[:mid, :]
     bot = gray[mid:, :]
-    top_std = float(top.std())
-    bot_std = float(bot.std())
     bot_extreme = float(((bot < 30.0) | (bot > 225.0)).sum()) / float(bot.size)
     top_extreme = float(((top < 30.0) | (top > 225.0)).sum()) / float(top.size)
     # B/W digital noise band — not natural ground texture.
@@ -1339,11 +1347,8 @@ def _rgb_frame_has_structural_tear(arr: "np.ndarray") -> bool:
     sky = gray[: max(8, h // 3), :]
     sh, sw = sky.shape
     if sh >= 16 and sw >= 16:
-        block_vars: list[float] = []
-        for y in range(0, sh - 8, 8):
-            for x in range(0, sw - 8, 8):
-                block_vars.append(float(sky[y : y + 8, x : x + 8].std()))
-        if block_vars:
+        block_vars = _gray_tiles_8x8(sky, 8).std(axis=(2, 3)).astype(np.float64).ravel()
+        if block_vars.size:
             med_v = float(np.median(block_vars))
             max_v = float(np.max(block_vars))
             if max_v > 55.0 and max_v > med_v * 3.2 and med_v > 10.0:
@@ -1845,6 +1850,73 @@ def _demux_preflags_for_url(url: str, *, rtsp_transport: str | None) -> list[str
             *base,
         ]
     return ["-fflags", "+genpts+discardcorrupt", *base]
+
+
+class _NewestFrameReader:
+    """Reads FFmpeg's raw frames as fast as they come and keeps only the newest (B29, B28).
+
+    FFmpeg's stdout is a pipe of a few kB on Windows (64 kB on Linux), far less than one frame
+    (1.5 MB at 960x540), so a whole frame never waits in it. While the decode loop checked a
+    frame, FFmpeg blocked on its write, stopped reading the camera, and the stream waited in
+    the socket instead: over TCP nothing is lost, the picture only comes later, and the
+    backlog drains only as fast as the loop reads beyond the camera's rate. The old pipe drain
+    could never see a whole frame, so it never dropped one. This thread keeps the pipe empty,
+    the loop takes the newest whole frame, and the frames it had no time for are dropped.
+
+    ``on_frame`` gets every frame in this thread (the recording keeps all of them).
+    """
+
+    def __init__(
+        self,
+        read_exact: Callable[[object, int], "bytes | None"],
+        stream: object,
+        frame_bytes: int,
+        *,
+        on_frame: Callable[[bytes], None] | None = None,
+    ) -> None:
+        self._read_exact = read_exact
+        self._stream = stream
+        self._frame_bytes = int(frame_bytes)
+        self._on_frame = on_frame
+        self._cond = threading.Condition()
+        self._newest: bytes | None = None
+        self._ended = False
+        self.read = 0
+        self.dropped = 0
+        self._thread = threading.Thread(target=self._run, name="vgcs-ffmpeg-frames", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                raw = self._read_exact(self._stream, self._frame_bytes)
+                if raw is None:
+                    return
+                if self._on_frame is not None:
+                    try:
+                        self._on_frame(raw)
+                    except Exception as e:  # noqa: BLE001  (a recording fault must not end the preview)
+                        print(f"[VGCS:video] frame reader: recording write failed: {e}")
+                with self._cond:
+                    if self._newest is not None:
+                        self.dropped += 1
+                    self._newest = raw
+                    self.read += 1
+                    self._cond.notify_all()
+        finally:
+            with self._cond:
+                self._ended = True
+                self._cond.notify_all()
+
+    def next_frame(self, stop: threading.Event) -> bytes | None:
+        """The newest frame not taken yet; waits for one. None when FFmpeg's output ended or ``stop`` is set."""
+        with self._cond:
+            while self._newest is None and not self._ended:
+                if stop.is_set():
+                    return None
+                self._cond.wait(0.1)
+            raw, self._newest = self._newest, None
+            return raw
 
 
 class AiVideoHook(Protocol):
@@ -2944,76 +3016,6 @@ class RtspSource(QObject):
             buf.extend(chunk)
         return bytes(buf) if len(buf) == n else None
 
-    def _pipe_bytes_available(self, stream) -> int:
-        """Best-effort count of bytes already buffered in the FFmpeg stdout pipe.
-
-        Used to drop backlogged frames so preview stays real-time (bounded
-        latency) instead of drifting behind — critical during M13 track, where
-        RTSP reconnect (which would otherwise flush the backlog) is disabled.
-        Returns 0 when it cannot be determined (never blocks).
-        """
-        try:
-            fileno = stream.fileno()
-        except Exception:
-            return 0
-        # Windows: PeekNamedPipe on the underlying OS handle.
-        if os.name == "nt":
-            try:
-                import ctypes
-                from ctypes import wintypes
-                import msvcrt
-
-                handle = msvcrt.get_osfhandle(fileno)
-                avail = wintypes.DWORD(0)
-                ok = ctypes.windll.kernel32.PeekNamedPipe(
-                    wintypes.HANDLE(handle),
-                    None,
-                    0,
-                    None,
-                    ctypes.byref(avail),
-                    None,
-                )
-                if not ok:
-                    return 0
-                return int(avail.value)
-            except Exception:
-                return 0
-        # POSIX: select with zero timeout only tells us readable, not count.
-        # Use FIONREAD ioctl for an actual byte count.
-        try:
-            import fcntl
-            import termios
-            import array
-
-            buf = array.array("i", [0])
-            fcntl.ioctl(fileno, termios.FIONREAD, buf, True)
-            return int(buf[0])
-        except Exception:
-            return 0
-
-    def _drain_stale_frames(self, stream, frame_bytes: int, *, max_drop: int = 8) -> bytes | None:
-        """Discard whole backlogged frames, returning the newest fully-buffered one.
-
-        Only consumes frames that are *already* sitting in the pipe buffer, so it
-        never blocks waiting for the camera. Bounds preview latency to ~1 frame
-        even when the decoder/UI briefly falls behind the stream FPS.
-        """
-        newest: bytes | None = None
-        dropped = 0
-        while dropped < max_drop and not self._ffmpeg_stop.is_set():
-            if self._pipe_bytes_available(stream) < frame_bytes:
-                break
-            frame = self._read_exact(stream, frame_bytes)
-            if frame is None:
-                return newest
-            newest = frame
-            dropped += 1
-        if dropped:
-            self._ffmpeg_drained_frames = int(
-                getattr(self, "_ffmpeg_drained_frames", 0) or 0
-            ) + dropped
-        return newest
-
     def _start_ffmpeg_stall_watchdog(
         self,
         proc: subprocess.Popen[bytes],
@@ -3469,6 +3471,14 @@ class RtspSource(QObject):
                                 frames_counter=frame_count_box,
                             )
                         read_fail_streak = 0
+                        frame_reader: _NewestFrameReader | None = None
+                        if _companion_low_latency_drain_enabled():
+                            frame_reader = _NewestFrameReader(
+                                self._read_exact,
+                                p.stdout,
+                                frame_bytes,
+                                on_frame=lambda fr, _w=w, _h=h: self._write_recording_frame(fr, _w, _h),
+                            )
                         try:
                             while not _ended():
                                 if (
@@ -3484,7 +3494,16 @@ class RtspSource(QObject):
                                         )
                                     except Exception:
                                         pass
-                                raw = self._read_exact(p.stdout, frame_bytes)
+                                # Real-time preview: the reader thread keeps FFmpeg's
+                                # pipe empty and hands over the newest frame, so the
+                                # delay stays bounded when the checks below fall behind
+                                # the camera's rate (B29, B28). This matters most during
+                                # M13 track, when the RTSP reconnect that would otherwise
+                                # flush a backlog is disabled to protect the single client.
+                                if frame_reader is not None:
+                                    raw = frame_reader.next_frame(self._ffmpeg_stop)
+                                else:
+                                    raw = self._read_exact(p.stdout, frame_bytes)
                                 if raw is None:
                                     if p.poll() is None and read_fail_streak < 40:
                                         read_fail_streak += 1
@@ -3492,18 +3511,6 @@ class RtspSource(QObject):
                                         continue
                                     break
                                 read_fail_streak = 0
-                                # Real-time preview: if FFmpeg has already buffered
-                                # newer frames in the pipe (decoder/UI fell behind the
-                                # stream FPS), skip to the newest one so latency stays
-                                # bounded. This is essential during M13 track, when the
-                                # RTSP reconnect that would otherwise flush a backlog is
-                                # intentionally disabled to protect the single client.
-                                if _companion_low_latency_drain_enabled():
-                                    newest = self._drain_stale_frames(
-                                        p.stdout, frame_bytes
-                                    )
-                                    if newest is not None:
-                                        raw = newest
                                 now_decode = time.monotonic()
                                 self._ffmpeg_last_decode_mono = now_decode
                                 try:
@@ -3530,7 +3537,9 @@ class RtspSource(QObject):
                                                 pass
                                         self._end_decode_session_proc(p)
                                         break
-                                self._write_recording_frame(raw, w, h)
+                                if frame_reader is None:
+                                    # With the reader, every frame went to the recording there.
+                                    self._write_recording_frame(raw, w, h)
                                 now = time.monotonic()
                                 if (now - last_emit_mono) < min_emit_dt:
                                     continue
@@ -3843,6 +3852,16 @@ class RtspSource(QObject):
                                     continue
                         finally:
                             session_stop.set()
+                            if frame_reader is not None and frame_reader.dropped:
+                                self._ffmpeg_drained_frames = (
+                                    int(getattr(self, "_ffmpeg_drained_frames", 0) or 0)
+                                    + frame_reader.dropped
+                                )
+                                print(
+                                    "[VGCS:video] decode session: "
+                                    f"{frame_reader.dropped} of {frame_reader.read} frames "
+                                    "skipped to keep the picture live"
+                                )
 
                         proc = p  # this session's own: the stored one may be the next session's (B32)
                         rc: int | None = None

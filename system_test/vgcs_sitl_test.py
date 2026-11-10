@@ -395,6 +395,7 @@ def parameters(version: str, r: Report) -> None:
         from vgcs.app.vehicle_params import (
             EDITABLE,
             READ_ON_CONNECT,
+            RENAMED_IN_4_6,
             RENAMED_IN_4_7,
             SPEEDS_RENAMED_IN_4_7,
             editable_on_this_drone,
@@ -411,7 +412,12 @@ def parameters(version: str, r: Report) -> None:
             has = [n for n in (old, new) if n in got]
             r.check(len(has) == 1 and has[0] == (old if version.startswith("4.6") else new),
                     f"{old} / {new}: the drone has exactly one of the two names, this version's ({has})")
-        must_have = [n for n in names if n not in renamed and n not in renamed.values()]
+        for old, new in RENAMED_IN_4_6.items():
+            # Both 4.6 and 4.7 have only the new name; VGCS asks for the old one for older firmware.
+            has = [n for n in (old, new) if n in got]
+            r.check(has == [new], f"{old} / {new}: the drone has the name of 4.6 and later only ({has})")
+        before_4_6 = {*RENAMED_IN_4_6, *RENAMED_IN_4_6.values()}
+        must_have = [n for n in names if n not in renamed and n not in renamed.values() and n not in before_4_6]
         missing = [n for n in must_have if n not in got]
         r.check(not missing, f"every other setting VGCS reads is on this firmware ({len(must_have) - len(missing)} of {len(must_have)})"
                 + (f". Missing: {missing}" if missing else ""))
