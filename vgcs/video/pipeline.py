@@ -1690,6 +1690,15 @@ def _looks_like_hwaccel_failure(stderr_lower: bytes) -> bool:
     return any(word in stderr_lower for word in _HWACCEL_FAILURE_WORDS)
 
 
+# Open only a camera's video track (row B29, 2026-11-12). VGCS never uses a camera's sound. A camera
+# that lists a sound track but never sends it (most likely the V20: a stand-in camera with such a
+# track gave its 12 s exactly) held FFmpeg's stream check (-analyzeduration, 12 s for a companion
+# camera) to the end. FFmpeg kept the video it read meanwhile and played it first, so the client's
+# first picture came 12.4 s after FFmpeg's start, began 12 s behind, and caught up only as fast as
+# the decoder beat the camera's 20 frames a second. With this option: 1.9 s, and live.
+_RTSP_VIDEO_TRACK_ONLY = ("-allowed_media_types", "video")
+
+
 def _ffmpeg_preflags_before_input(
     url: str,
     *,
@@ -1701,7 +1710,7 @@ def _ffmpeg_preflags_before_input(
     sc = _url_scheme(str(url or "").strip())
     out: list[str] = []
     if sc == "rtsp" and rtsp_transport in ("udp", "tcp"):
-        out.extend(["-rtsp_transport", rtsp_transport])
+        out.extend(["-rtsp_transport", rtsp_transport, *_RTSP_VIDEO_TRACK_ONLY])
         u = str(url or "").strip()
         io_us = _rtsp_socket_timeout_us(u)
         if io_us > 0:
@@ -1770,6 +1779,8 @@ def _ffmpeg_preflags_before_input(
             out.extend(["-thread_queue_size", "512", "-max_delay", str(max_delay_us)])
             # Decoder opts must be before `-i` (after `-i` they apply to rawvideo output and fail).
             out.extend(["-threads", "1"])
+    elif sc == "rtsp":
+        out.extend(_RTSP_VIDEO_TRACK_ONLY)
     if hwaccel:
         # FFmpeg hands the decoded pictures back in normal memory, so the filter
         # needs no hwdownload (_ffmpeg_vf_rgb_fixed_size).
@@ -1838,7 +1849,9 @@ def _demux_preflags_for_url(url: str, *, rtsp_transport: str | None) -> list[str
     sc = _url_scheme(url)
     base = ["-err_detect", "ignore_err"]
     if sc == "rtsp" and rtsp_transport in ("tcp", "udp"):
-        return ["-rtsp_transport", rtsp_transport, "-fflags", "+genpts+discardcorrupt", *base]
+        return ["-rtsp_transport", rtsp_transport, *_RTSP_VIDEO_TRACK_ONLY, "-fflags", "+genpts+discardcorrupt", *base]
+    if sc == "rtsp":
+        return [*_RTSP_VIDEO_TRACK_ONLY, "-fflags", "+genpts+discardcorrupt", *base]
     if sc == "udp":
         return [
             "-fflags",
@@ -3831,9 +3844,12 @@ class RtspSource(QObject):
                                         self._ffmpeg_graceful_quit_misses = 0
                                         self._ffmpeg_graceful_quit_unavailable = False
                                         try:
+                                            # How long since this FFmpeg started: the V20's
+                                            # 12.4 s showed its stream check waiting (row B29).
                                             print(
                                                 f"[VGCS:video] {tag} frame ok "
-                                                f"{w}x{h} transport={tr_label} url={url}"
+                                                f"{w}x{h} transport={tr_label} "
+                                                f"after {time.monotonic() - session_t0:.1f} s url={url}"
                                             )
                                         except Exception:
                                             pass

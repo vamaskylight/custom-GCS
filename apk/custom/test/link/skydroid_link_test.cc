@@ -465,6 +465,7 @@ public:
 
     void hangUp()
     {
+        _pending.clear();
         if (_conn) {
             QTcpSocket *conn = std::exchange(_conn, nullptr);
             conn->disconnect(this);
@@ -474,6 +475,8 @@ public:
     }
 
 private:
+    c20::Bytes _pending;  // a command not complete yet
+
     void _read()
     {
         if (!_conn) {
@@ -481,7 +484,22 @@ private:
         }
         const QByteArray data = _conn->readAll();
         const auto *bytes = reinterpret_cast<const std::uint8_t *>(data.constData());
-        for (const c20::Bytes &packet : c20::splitPackets(c20::Bytes(bytes, bytes + data.size()))) {
+        _pending.insert(_pending.end(), bytes, bytes + data.size());
+        // A camera takes the app's commands by their length field. The SDK's rule for replies (a reply
+        // shorter than the SDK wants takes the rest of the read, c20::splitPackets) is not how a camera
+        // reads: with it, a zoom question (2 bytes of payload) and the zoom command written right after it
+        // came as one packet when they arrived in one read, and the test missed the zoom (1 run in 3,
+        // 2026-11-10).
+        std::vector<c20::Bytes> packets;
+        while (_pending.size() >= c20::kHeaderLen) {
+            const std::size_t end = c20::kHeaderLen + ((static_cast<std::size_t>(_pending[8]) << 8) | _pending[9]);
+            if (_pending.size() < end) {
+                break;  // the rest comes with the next read
+            }
+            packets.emplace_back(_pending.begin(), _pending.begin() + static_cast<std::ptrdiff_t>(end));
+            _pending.erase(_pending.begin(), _pending.begin() + static_cast<std::ptrdiff_t>(end));
+        }
+        for (const c20::Bytes &packet : packets) {
             received.push_back(packet);
             if (packet == c20::stateQuery()) {
                 _lastState = _clock.elapsed();
